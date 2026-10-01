@@ -1,0 +1,32 @@
+{
+  "id": "./",
+  "name": "Vanguard 25K Desk",
+  "short_name": "Vanguard Desk",
+  "description": "Trading journal and risk desk for the 25K futures challenge.",
+  "lang": "en",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0c1117",
+  "theme_color": "#2648d1",
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
