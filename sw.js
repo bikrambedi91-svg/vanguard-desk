@@ -14,7 +14,7 @@
 'use strict';
 
 const CACHE_PREFIX = 'vdesk-';
-const CACHE = CACHE_PREFIX + '202610012018';
+const CACHE = CACHE_PREFIX + '202610012045';
 
 const PRECACHE = [
   './',

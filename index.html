@@ -424,6 +424,12 @@ details > summary { cursor: pointer; font-weight: 600; }
   const dayMs = (iso) => Date.parse(iso + 'T00:00:00Z');
   const addDays = (iso, n) => isoOf(dayMs(iso) + n * DAY);
   const weekdayOf = (iso) => new Date(dayMs(iso)).getUTCDay();
+  /** The trading session before `iso` (skips weekends). */
+  function prevTradingDay(iso) {
+    let d = addDays(iso, -1);
+    while (weekdayOf(d) === 0 || weekdayOf(d) === 6) d = addDays(d, -1);
+    return d;
+  }
   /** ET wall-clock time -> epoch ms (handles DST). */
   function etToUtc(y, mo, d, h, mi) {
     const want = Date.UTC(y, mo - 1, d, h, mi);
@@ -546,7 +552,8 @@ details > summary { cursor: pointer; font-weight: 600; }
     const R = risk ? Math.round((net / risk) * 100) / 100 : null;
     const openMs = t.openTs ? Date.parse(t.openTs) : null;
     const closeMs = t.closeTs ? Date.parse(t.closeTs) : openMs;
-    const holdSec = openMs && closeMs && closeMs >= openMs ? Math.round((closeMs - openMs) / 1000) : null;
+    // a trade still open (no close time) has no hold time yet
+    const holdSec = openMs && t.closeTs && closeMs >= openMs ? Math.round((closeMs - openMs) / 1000) : null;
     let reward = null;
     if (i && isNum(t.entry) && isNum(t.target)) reward = r2(Math.abs(t.target - t.entry) / i.tick * i.tv * qty);
     return { inst: i, qty, dir, ticks, gross, fees, net, risk, stopTicks, R, holdSec, reward, closeMs, openMs };
@@ -651,7 +658,9 @@ details > summary { cursor: pointer; font-weight: 600; }
       const tightest = out.caps.filter((c) => c.binding)[0];
       out.warnings.push(tightest && tightest.key === 'limit'
         ? 'You are already at the contract limit.'
-        : `Even 1 contract risks $${perC.toFixed(2)} here, which does not fit under "${tightest ? tightest.label : 'the limit'}"${tightest && tightest.dollars != null ? ` ($${tightest.dollars.toFixed(2)})` : ''}. Tighten the stop or use the micro.`);
+        : tightest && tightest.dollars != null && tightest.dollars <= 0
+          ? `"${tightest.label}" has no room left, so no size fits.`
+          : `Even 1 contract risks $${perC.toFixed(2)} here, which does not fit under "${tightest ? tightest.label : 'the limit'}"${tightest && tightest.dollars != null ? ` ($${tightest.dollars.toFixed(2)})` : ''}. Tighten the stop or use the micro.`);
     } else if (mtl > 0 && worst + sameRisk >= 0.9 * mtl - 1e-9) {
       // rulebook: warn near the cap (the cap itself is enforced strictly above)
       out.warnings.push(`This puts ${Math.round(((worst + sameRisk) / mtl) * 1000) / 10}% of the $${mtl.toFixed(0)} max trade loss at risk${sameRisk > 0 ? ' together with your open position' : ''}. One bad fill could breach it.`);
@@ -663,8 +672,12 @@ details > summary { cursor: pointer; font-weight: 600; }
     out.ladderBindingLabel = tight ? tight.label : null;
     out.ladder = [];
     const hasPx = p.mode !== 'ticks' && isNum(p.entry);
+    // the sizer charges the cent-rounded perContract, so a row must also fit with that (M6B, ZF, ZT ticks have sub-cent values)
+    const rowCents = (t, n) => Math.round(r2((t + slip) * tv + 2 * fee) * n * 100);
+    const budgetCents = Math.round(out.ladderBudget * 100);
     for (let n = 1; n <= Math.min(limitN, 10); n++) {
-      const t = Math.ceil((out.ladderBudget / n - 2 * fee) / tv - slip - 1e-9) - 1;
+      let t = Math.ceil((out.ladderBudget / n - 2 * fee) / tv - slip - 1e-9) - 1;
+      while (t >= 1 && rowCents(t, n) >= budgetCents) t--;
       if (t < 1) break;
       let ticks = t, points = Math.round(t * tick * 1e9) / 1e9, price = null;
       if (hasPx) {
@@ -677,7 +690,8 @@ details > summary { cursor: pointer; font-weight: 600; }
         points = Math.round(dist * 1e9) / 1e9;
         if (ticks < 1) break;
       }
-      const row = { n, ticks, points, dollars: r2(ticks * tv * n), worst: r2(((ticks + slip) * tv + 2 * fee) * n) };
+      // worst = what the sizer shows as worstCase for n contracts at this stop
+      const row = { n, ticks, points, dollars: r2(ticks * tv * n), worst: r2(r2((ticks + slip) * tv + 2 * fee) * n) };
       if (price != null) row.price = price;
       out.ladder.push(row);
     }
@@ -731,12 +745,13 @@ details > summary { cursor: pointer; font-weight: 600; }
     if (!dayKeys.includes(today)) dayKeys.push(today);
     dayKeys.sort();
 
-    const mode = R.trailingMode || 'both';
+    // an unknown mode has always behaved as 'both'; name it so rtCap and riskNow agree
+    const mode = R.trailingMode === 'eod' || R.trailingMode === 'rt' ? R.trailingMode : 'both';
     const rtLock = r2(size + num(R.rtLockOffset, 0));
     const dPct = num(R.dailyPct, 2) / 100;
     const lockLevel = mode === 'eod' ? lockAt : mode === 'rt' ? rtLock : Math.max(lockAt, rtLock);
     // in 'both' the real-time reading also stops at the stricter lock level, not at rtLock
-    const rtCap = mode === 'rt' ? rtLock : lockLevel;
+    const rtCap = mode === 'both' ? lockLevel : rtLock;
     // dashboard values typed on days without trades still count from then on
     const ovKeys = Object.keys(dayDocs).filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k)).sort();
     let ovIdx = 0;
@@ -765,7 +780,12 @@ details > summary { cursor: pointer; font-weight: 600; }
       // typed dashboard values only ever tighten
       const floorTyped = isNum(ov.floor);
       const floor = floorTyped ? r2(Math.max(+ov.floor, floorCalc)) : floorCalc;
-      const base = isNum(ov.sodBalance) ? Math.max(+ov.sodBalance, startBal) : startBal;
+      // the snapshot is the higher of equity or balance at 5 PM ET: an open profit typed on the
+      // previous session and never cleared means a position was likely held through the reset
+      const prevTd = prevTradingDay(day);
+      const carried = isNum((dayDocs[prevTd] || {}).openPnl) ? +dayDocs[prevTd].openPnl : 0;
+      let base = isNum(ov.sodBalance) ? Math.max(+ov.sodBalance, startBal) : startBal;
+      if (carried > 0) base = Math.max(base, r2(startBal + carried));
       // articles say both "2% of account size" and "reset value x (1 - 2%)": use the stricter
       const dailyCalc = r2(Math.max(base * (1 - dPct), base - size * dPct));
       const dailyTyped = isNum(ov.dailyLimit);
@@ -800,6 +820,7 @@ details > summary { cursor: pointer; font-weight: 600; }
       const row = {
         day, startBal, endBal: bal, minBal, net, gross, fees, n, wins, losses,
         floor, floorLive, floorCalc, floorTyped, dailyLimit, dailyCalc, dailyTyped, flags, done, isToday: day === today,
+        snapshot: r2(base), carriedOpen: carried,
         qualifying: qualMin > 0 && net >= qualMin - 1e-9 && n > 0,
         payoutDay: its.some((x) => x.kind === 'payout'), payoutToday,
       };
@@ -833,7 +854,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     const trailRoom = r2(equity - floor);
     const room = Math.min(dailyRoom, trailRoom);
     const binding = dailyRoom <= trailRoom ? 'daily' : 'trail';
-    const allowance = r2(t.startBal - t.dailyLimit);
+    const allowance = r2(num(t.snapshot, t.startBal) - t.dailyLimit);
     return { equity, floor, dailyRoom, trailRoom, room: r2(room), binding, floorAbs: Math.max(t.dailyLimit, floor), allowance };
   }
 
@@ -1225,13 +1246,23 @@ details > summary { cursor: pointer; font-weight: 600; }
   const toNum = (x) => (typeof x === 'number' ? (Number.isFinite(x) ? x : undefined)
     : typeof x === 'string' && x.trim() !== '' && Number.isFinite(+x) ? +x : undefined);
   const toStr = (x, max) => (typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean' ? String(x).slice(0, max) : undefined);
-  const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/;
+  // only ISO date-times: Date.parse alone takes "1" or "hello 2026" in Chrome, and rolls 02-30 into March
+  // there while Safari rejects it, so the same synced trade would differ between devices
+  const ISO_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(Z|([+-])(\d{2}):?(\d{2}))?$/;
+  const PLAIN_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
   function toIso(x) {
     if (typeof x !== 'string') return undefined;
     const s = x.trim();
-    const ms = Date.parse(s);
+    const m = s.match(ISO_RE);
+    if (!m) return undefined;
+    const [y, mo, d, h, mi, se, oh, om] = [1, 2, 3, 4, 5, 6, 10, 11].map((k) => +(m[k] || 0));
+    if (mo < 1 || mo > 12 || d < 1 || d > new Date(Date.UTC(y, mo, 0)).getUTCDate() || h > 23 || mi > 59 || se > 59 || oh > 23 || om > 59) return undefined;
+    const frac = m[7] ? Math.floor(+('0' + m[7]) * 1000) : 0;
+    // no zone = local wall time, as the app's datetime inputs are read
+    const ms = m[8] ? Date.UTC(y, mo - 1, d, h, mi, se, frac) - (m[9] === '-' ? -1 : 1) * (oh * 60 + om) * 6e4
+      : new Date(y, mo - 1, d, h, mi, se, frac).getTime();
     if (!Number.isFinite(ms)) return undefined;
-    return ISO_RE.test(s) ? s : new Date(ms).toISOString();
+    return PLAIN_ISO.test(s) ? s : new Date(ms).toISOString();
   }
   const SHOT_ID = /^[A-Za-z0-9_.~:@+-]{1,120}$/;
   const TRADE_NUMS = ['entry', 'exit', 'stop', 'target', 'fees', 'netManual', 'riskManual'];
@@ -1291,7 +1322,7 @@ details > summary { cursor: pointer; font-weight: 600; }
 
   return {
     DAY, r2, isNum, num, INSTRUMENTS, inst, rootSymbol, decimalsOf,
-    etParts, etToUtc, tradingDay, nextReset, marketStatus, addDays, weekdayOf, isoOf,
+    etParts, etToUtc, tradingDay, nextReset, marketStatus, addDays, weekdayOf, prevTradingDay, isoOf,
     PROGRAMS, vanguardRules, thunderboltRules, rulesFor, VANGUARD_CAPS, feePerSide, tradeCalc, sizeTrade, buildLedger, riskNow,
     payoutStatus, payoutNet, inactivity, stats, parseCSV, guessMapping, rowsToTrades, rowsToFills, pairFills, parseMoney, parseWhen, parseSide, toCSV,
     parsePrice, sanitizeTrade, sanitizeRules,
@@ -1393,7 +1424,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     },
   ];
   window.PROHIBITED = [
-    'Closing trades in under 2 minutes again and again (tick scalping), HFT, latency or arbitrage tricks',
+    'Closing a trade in under 2 minutes (treated as tick scalping, so hold every trade at least 2:00), HFT, latency or arbitrage tricks',
     'Hedging: long and short the same instrument at once, or opposite positions across accounts',
     'Martingale or adding to a loser to force break-even, and grid trading',
     'All-or-nothing max-size bets, or trading to game the drawdown',
@@ -1427,16 +1458,18 @@ details > summary { cursor: pointer; font-weight: 600; }
    - cloud:  the claude.ai artifact's private database, when the page is opened on claude.ai
    - local:  this browser (localStorage + IndexedDB for screenshots), on the public site
    - GitHub: optional sync of the local copy to a private repo the trader owns, for several devices
-   Nothing is dropped on a failed save: it waits in an outbox and is retried. */
+   Rules that keep data safe:
+   - every cloud write goes into an outbox first and leaves it only once saved
+   - every copy is merged, never overwritten: newest edit wins per record (per field for day notes),
+     a delete wins over an older edit, and no account is ever dropped */
 (function () {
   'use strict';
   const LS = {
-    local: 'v25k.local.v1', cache: 'v25k.cache.v1', outbox: 'v25k.outbox.v1',
-    gh: 'v25k.github.v1', tomb: 'v25k.tomb.v1', imgq: 'v25k.imgq.v1', ghsha: 'v25k.ghsha.v1',
+    local: 'v25k.local.v1', cache: 'v25k.cache.v1', outbox: 'v25k.outbox.v1', gh: 'v25k.github.v1',
+    ghrepo: 'v25k.ghrepo.v1', tomb: 'v25k.tomb.v1', imgq: 'v25k.imgq.v1', imgdone: 'v25k.imgdone.v1',
   };
   const COLLS = ['trades', 'days', 'events'];
   const DATA_FILE = 'journal.json';
-  const nowIso = () => new Date().toISOString();
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const jitter = (a, b) => a + Math.floor(Math.random() * (b - a));
   const lsGet = (k) => { try { const s = localStorage.getItem(k); return s ? JSON.parse(s) : null; } catch (e) { return null; } };
@@ -1445,6 +1478,16 @@ details > summary { cursor: pointer; font-weight: 600; }
   const clean = (o) => JSON.parse(JSON.stringify(o, (k, v) => (typeof v === 'number' && !Number.isFinite(v) ? null : v)));
   const uid = (p) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   const ID_RE = /^[A-Za-z0-9_.~:@+-]{1,180}$/;
+  const maxIso = (a, b) => ((a || '') > (b || '') ? a : b);
+
+  // timestamps that never go backwards on this device, and always beat the record being replaced
+  let lastTs = '';
+  function stamp(floor) {
+    let t = new Date().toISOString();
+    for (const f of [lastTs, floor]) if (f && t <= f) t = new Date(Date.parse(f) + 1).toISOString();
+    lastTs = t;
+    return t;
+  }
 
   /* ---------- UTF-8 base64 for the GitHub contents API ---------- */
   function bytesToB64(bytes) {
@@ -1487,34 +1530,60 @@ details > summary { cursor: pointer; font-weight: 600; }
   const idbGet = (id) => idbOp('readonly', (s) => s.get(id));
   const idbDel = (id) => idbOp('readwrite', (s) => s.delete(id));
 
-  /* ---------- merge two journal copies (used by GitHub sync) ---------- */
-  // Newest `updated` wins per record; a delete (tombstone) wins over an older record.
+  /* ---------- merging two copies of the journal ---------- */
+  // settings come from the newer copy, but no account is ever dropped
+  function mergeApp(la, ra) {
+    if (!ra) return la;
+    if (!la) return ra;
+    const win = (ra.updated || '') > (la.updated || '') ? ra : la;
+    const lose = win === la ? ra : la;
+    const ids = new Set((win.accounts || []).map((a) => a && a.id));
+    const extra = (lose.accounts || []).filter((a) => a && !ids.has(a.id));
+    return extra.length ? Object.assign({}, win, { accounts: (win.accounts || []).concat(extra) }) : win;
+  }
+  // day notes merge field by field using the per-field stamps in `fu`
+  function mergeDay(x, y) {
+    const base = (x.updated || '') >= (y.updated || '') ? x : y;
+    const other = base === x ? y : x;
+    const out = JSON.parse(JSON.stringify(base));
+    const fb = base.fu || {}, fo = other.fu || {};
+    out.fu = Object.assign({}, fo, fb);
+    for (const [k, t] of Object.entries(fo)) {
+      if (t <= (fb[k] || '')) continue;
+      out.fu[k] = t;
+      if (k.startsWith('checks.')) {
+        const ck = k.slice(7);
+        out.checks = Object.assign({}, out.checks || {});
+        const v = (other.checks || {})[ck];
+        if (v === undefined) delete out.checks[ck]; else out.checks[ck] = v;
+      } else if (other[k] === undefined) delete out[k];
+      else out[k] = other[k];
+    }
+    out.updated = maxIso(x.updated, y.updated);
+    return out;
+  }
   function mergeData(local, remote) {
     if (!remote) return local;
-    const out = { app: null, tomb: {} };
-    const la = local.app, ra = remote.app;
-    out.app = !ra ? la : !la ? ra : ((ra.updated || '') > (la.updated || '') ? ra : la);
-    // settings come from the newer copy, but no account is ever dropped
-    if (la && ra) {
-      const loser = out.app === la ? ra : la;
-      const ids = new Set((out.app.accounts || []).map((a) => a && a.id));
-      const extra = (loser.accounts || []).filter((a) => a && !ids.has(a.id));
-      if (extra.length) out.app = Object.assign({}, out.app, { accounts: (out.app.accounts || []).concat(extra) });
-    }
+    const out = { app: mergeApp(local.app, remote.app), tomb: {} };
     const tombs = Object.assign({}, remote.tomb || {});
     for (const [k, v] of Object.entries(local.tomb || {})) if (!tombs[k] || v > tombs[k]) tombs[k] = v;
+    // an account folded into another on first connect stays gone everywhere
+    if (out.app && (out.app.accounts || []).some((a) => a && tombs['accounts/' + a.id])) {
+      out.app = Object.assign({}, out.app, { accounts: out.app.accounts.filter((a) => a && !tombs['accounts/' + a.id]) });
+    }
     for (const coll of COLLS) {
       const m = new Map();
       for (const x of remote[coll] || []) if (x && x.id) m.set(x.id, x);
       for (const x of local[coll] || []) {
         if (!x || !x.id) continue;
         const r = m.get(x.id);
-        if (!r || (x.updated || '') >= (r.updated || '')) m.set(x.id, x);
+        if (!r) m.set(x.id, x);
+        else if (coll === 'days') m.set(x.id, mergeDay(x, r));
+        else if ((x.updated || '') >= (r.updated || '')) m.set(x.id, x);
       }
       for (const [id, x] of m) { const t = tombs[coll + '/' + id]; if (t && t >= (x.updated || '')) m.delete(id); }
       out[coll] = [...m.values()].sort((a, b) => (a.id < b.id ? -1 : 1));
     }
-    // forget tombstones after 180 days
     const cut = new Date(Date.now() - 180 * 864e5).toISOString();
     for (const [k, v] of Object.entries(tombs)) if (v >= cut) out.tomb[k] = v;
     return out;
@@ -1525,13 +1594,13 @@ details > summary { cursor: pointer; font-weight: 600; }
     // H: { notify(), toast(msg, ms), migrateApp(a), sanitize(coll, doc) -> doc|null }
     const st = {
       mode: 'loading', // loading | cloud | local | offline
-      readOnly: false, pending: 0, error: null, liveDead: false,
+      readOnly: false, unreachable: false, pending: 0, error: null, liveDead: false,
       outbox: 0, gh: lsGet(LS.gh), ghState: 'off', ghLast: null, ghError: null,
     };
     let db = null, assets = null;
     const queues = new Map();
     const inflight = new Set();
-    let appTimer = null, cacheTimer = null, ghTimer = null, ghBusy = false, ghAgain = false, resubscribed = false;
+    let appTimer = null, cacheTimer = null, ghTimer = null, ghBusy = false, ghAgain = false, resubscribed = false, pollStarted = false;
     let unsubs = [];
     let outbox = lsGet(LS.outbox) || {};
     let tomb = lsGet(LS.tomb) || {};
@@ -1554,6 +1623,7 @@ details > summary { cursor: pointer; font-weight: 600; }
       }
       return m;
     }
+    const canon = (d) => ({ app: d && d.app ? H.migrateApp(d.app) : null, trades: [...sanitizeList('trades', d && d.trades).values()], days: [...sanitizeList('days', d && d.days).values()], events: [...sanitizeList('events', d && d.events).values()] });
     function hydrate(d) {
       if (!d) return;
       S.app = d.app ? H.migrateApp(d.app) : null;
@@ -1561,14 +1631,14 @@ details > summary { cursor: pointer; font-weight: 600; }
     }
     function overlayOutbox() {
       for (const e of Object.values(outbox)) {
-        if (e.op === 'app') { if (e.doc && (!S.app || (e.doc.updated || '') >= (S.app.updated || ''))) S.app = H.migrateApp(e.doc); continue; }
+        if (e.op === 'app') { if (e.doc) S.app = H.migrateApp(mergeApp(S.app, e.doc)); continue; }
         if (!S[e.coll]) continue;
         if (e.op === 'put') S[e.coll].set(e.id, e.doc);
         else if (e.op === 'del') S[e.coll].delete(e.id);
       }
     }
     function addOutbox(key, entry) { outbox[key] = entry; saveOutbox(); }
-    function dropOutbox(key) { if (outbox[key]) { delete outbox[key]; saveOutbox(); } }
+    function dropOutbox(key, entry) { if (outbox[key] && (!entry || outbox[key].seq === entry.seq)) { delete outbox[key]; saveOutbox(); } }
 
     /* ---------- startup ---------- */
     async function init() {
@@ -1579,14 +1649,20 @@ details > summary { cursor: pointer; font-weight: 600; }
       if (cached) { hydrate(cached); overlayOutbox(); notify(); }
       let dbx = null;
       try { dbx = await window.claude.use('db'); } catch (e) { dbx = null; }
-      if (!dbx) { if (cached) return goOffline(); return goLocal(); }
+      if (!dbx) return goOffline();
       db = dbx;
       try {
         const user = await window.claude.use('user').catch(() => null);
         if (user) { const can = await user.canEdit().catch(() => null); if (can === false) st.readOnly = true; }
-        let first;
-        try { first = await db.doc('desk/main').get(); }
-        catch (e) { await sleep(jitter(400, 1500)); first = await db.doc('desk/main').get(); }
+        let first = null, lastErr = null;
+        for (const wait of [0, 500, 1500, 4000]) {
+          if (wait) await sleep(wait + jitter(0, 400));
+          try { first = await db.doc('desk/main').get(); break; } catch (e) {
+            lastErr = e;
+            if (e && ['invalid_argument', 'revoked', 'not_granted'].includes(e.code)) break;
+          }
+        }
+        if (!first) throw lastErr || new Error('unreachable');
         S.app = first.exists ? H.migrateApp(first.data()) : null;
         if (!cached) for (const c of COLLS) S[c] = new Map();
         st.mode = 'cloud';
@@ -1598,9 +1674,10 @@ details > summary { cursor: pointer; font-weight: 600; }
         const local = lsGet(LS.local);
         if (local && ((local.trades && local.trades.length) || (local.events && local.events.length))) S.flags.pendingLocal = local;
         setInterval(() => { if (st.outbox && st.mode === 'cloud') flushOutbox(); }, 60000);
+        window.addEventListener('online', () => { if (st.mode === 'cloud') flushOutbox(); });
       } catch (e) {
         console.warn('db unavailable', e);
-        if (cached) goOffline(); else goLocal();
+        goOffline();
       }
     }
     async function loadOptional(inFrame) {
@@ -1611,9 +1688,8 @@ details > summary { cursor: pointer; font-weight: 600; }
       try { S.flags.sample = await window.claude.use('sample'); } catch (e) { S.flags.sample = null; }
       notify();
     }
-    function goOffline() {
-      st.mode = 'offline'; st.readOnly = true; S.ready = true; notify();
-    }
+    // inside claude.ai, never fall back to a separate browser-only journal: show the last copy read-only
+    function goOffline() { st.mode = 'offline'; st.readOnly = true; st.unreachable = true; S.ready = true; notify(); }
     function goLocal() {
       st.mode = 'local';
       db = null;
@@ -1624,7 +1700,24 @@ details > summary { cursor: pointer; font-weight: 600; }
       S.ready = true;
       if (had) saveLocal();
       notify();
-      if (st.gh) { ghSync('startup'); setInterval(() => { if (document.visibilityState === 'visible') ghSync('poll'); }, 90000); }
+      // another tab or the installed app saved: fold its changes in
+      window.addEventListener('storage', (e) => {
+        if (st.mode !== 'local' || (e.key !== LS.local && e.key !== LS.gh)) return;
+        if (e.key === LS.gh) { st.gh = lsGet(LS.gh); st.ghState = st.gh ? 'idle' : 'off'; notify(); return; }
+        const disk = lsGet(LS.local);
+        if (!disk) return;
+        const merged = mergeData(Object.assign(snapshotAll(), { tomb }), Object.assign({}, disk, { tomb: lsGet(LS.tomb) || {} }));
+        tomb = merged.tomb;
+        hydrate(merged);
+        notify();
+      });
+      startPoll();
+      if (st.gh) ghSync('startup');
+    }
+    function startPoll() {
+      if (pollStarted) return;
+      pollStarted = true;
+      setInterval(() => { if (document.visibilityState === 'visible' && st.gh) ghSync('poll'); }, 90000);
       document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && st.gh) ghSync('focus'); });
     }
     function subscribe() {
@@ -1638,9 +1731,8 @@ details > summary { cursor: pointer; font-weight: 600; }
         if (!s.exists) return;
         // our own unsaved settings edit is newer: keep it
         if (appTimer || inflight.has('desk/main') || outbox['desk/main']) return;
-        const remote = s.data();
-        if (S.app && S.app.updated && remote.updated && remote.updated < S.app.updated) return;
-        S.app = H.migrateApp(remote); notify();
+        S.app = H.migrateApp(mergeApp(S.app, s.data()));
+        notify();
       }, onErr));
       for (const coll of COLLS) {
         unsubs.push(db.collection(coll).onSnapshot((q) => {
@@ -1668,11 +1760,10 @@ details > summary { cursor: pointer; font-weight: 600; }
             if (e && (e.code === 'unavailable' || e.code === 'resource_exhausted')) { await sleep(jitter(600, 2000)); await fn(); }
             else throw e;
           }
-          dropOutbox(key);
+          dropOutbox(key, entry);
           return true;
         } catch (e) {
           st.error = e;
-          addOutbox(key, entry);
           const msg = e && e.code === 'quota_exceeded' ? 'Storage is full. Export a backup, then delete old trades.'
             : e && (e.code === 'invalid_argument' || e.code === 'not_granted') ? 'Only the owner can change this desk.'
               : 'Not saved to the cloud yet. It is kept on this device and will retry.';
@@ -1687,12 +1778,33 @@ details > summary { cursor: pointer; font-weight: 600; }
       queues.set(key, p);
       return p;
     }
-    function writeDoc(coll, id, op, doc) {
+    // a queued write never replaces a newer copy that another device already saved
+    function cloudWrite(key, e) {
+      if (e.op === 'app') {
+        return enqueue('desk/main', async () => {
+          const s = await db.doc('desk/main').get();
+          const doc = s.exists ? mergeApp(e.doc, s.data()) : e.doc;
+          await db.doc('desk/main').set(clean(doc));
+          if (s.exists && (doc.accounts || []).length > ((S.app && S.app.accounts) || []).length) { S.app = H.migrateApp(mergeApp(S.app, doc)); notify(); }
+        }, e);
+      }
+      return enqueue(key, async () => {
+        const ref = db.collection(e.coll).doc(e.id);
+        if (e.replay) {
+          const s = await ref.get();
+          const mine = e.op === 'put' ? (e.doc.updated || '') : (e.ts || '');
+          if (s.exists && (s.data().updated || '') > mine) return;
+        }
+        if (e.op === 'put') await ref.set(e.doc); else await ref.delete();
+      }, e);
+    }
+    function writeDoc(coll, id, op, doc, ts) {
       const key = coll + '/' + id;
-      const entry = { op, coll, id, doc: op === 'put' ? clean(doc) : null };
-      if (st.mode === 'loading') { addOutbox(key, entry); return Promise.resolve(true); }
+      const entry = { op, coll, id, doc: op === 'put' ? clean(doc) : null, ts, seq: stamp() };
+      addOutbox(key, entry); // write-ahead: survives a closed tab
+      if (st.mode === 'loading') return Promise.resolve(true);
       if (st.mode !== 'cloud') return Promise.resolve(false);
-      return enqueue(key, () => (op === 'put' ? db.collection(coll).doc(id).set(entry.doc) : db.collection(coll).doc(id).delete()), entry);
+      return cloudWrite(key, entry);
     }
     function guard() {
       if (st.readOnly) { H.toast(st.mode === 'offline' ? 'Can’t reach your synced journal. Reload to try again.' : 'You can view this desk but not change it.', 4000); return false; }
@@ -1700,7 +1812,8 @@ details > summary { cursor: pointer; font-weight: 600; }
     }
     function put(coll, obj) {
       if (!guard()) return Promise.resolve(false);
-      obj = Object.assign({}, obj, { updated: nowIso() });
+      const prev = S[coll].get(obj.id);
+      obj = Object.assign({}, obj, { updated: stamp(maxIso(prev && prev.updated, tomb[coll + '/' + obj.id])) });
       S[coll].set(obj.id, obj);
       delete tomb[coll + '/' + obj.id];
       notify();
@@ -1709,11 +1822,13 @@ details > summary { cursor: pointer; font-weight: 600; }
     }
     function del(coll, id) {
       if (!guard()) return Promise.resolve(false);
+      const prev = S[coll].get(id);
+      const t = stamp(prev && prev.updated);
       S[coll].delete(id);
-      tomb[coll + '/' + id] = nowIso();
+      tomb[coll + '/' + id] = t;
       notify();
       if (st.mode === 'local') { saveLocal(); ghSoon(); return Promise.resolve(true); }
-      return writeDoc(coll, id, 'del', null);
+      return writeDoc(coll, id, 'del', null, t);
     }
     async function pool(list, worker, onProgress) {
       let ok = 0, failed = 0, k = 0, done = 0;
@@ -1733,8 +1848,11 @@ details > summary { cursor: pointer; font-weight: 600; }
     async function putMany(coll, list, onProgress) {
       if (!guard()) return { ok: 0, failed: list.length };
       if (st.mode !== 'cloud') {
-        const t = nowIso();
-        for (const o of list) { S[coll].set(o.id, Object.assign({}, o, { updated: t })); delete tomb[coll + '/' + o.id]; }
+        for (const o of list) {
+          const prev = S[coll].get(o.id);
+          S[coll].set(o.id, Object.assign({}, o, { updated: stamp(prev && prev.updated) }));
+          delete tomb[coll + '/' + o.id];
+        }
         notify();
         if (st.mode === 'local') { saveLocal(); ghSoon(); }
         else for (const o of list) writeDoc(coll, o.id, 'put', S[coll].get(o.id));
@@ -1746,22 +1864,25 @@ details > summary { cursor: pointer; font-weight: 600; }
     async function delMany(coll, ids, onProgress) {
       if (!guard()) return { ok: 0, failed: ids.length };
       if (st.mode !== 'cloud') {
-        const t = nowIso();
-        for (const id of ids) { S[coll].delete(id); tomb[coll + '/' + id] = t; }
+        for (const id of ids) { const prev = S[coll].get(id); S[coll].delete(id); tomb[coll + '/' + id] = stamp(prev && prev.updated); }
         notify();
         if (st.mode === 'local') { saveLocal(); ghSoon(); }
-        else for (const id of ids) writeDoc(coll, id, 'del', null);
         return { ok: ids.length, failed: 0 };
       }
       return pool(ids, (id) => del(coll, id), onProgress);
     }
     function saveApp(now) {
       if (!guard()) return Promise.resolve(false);
-      S.app.updated = nowIso();
+      S.app.updated = stamp(S.app.updated);
       notify();
       if (st.mode === 'local') { saveLocal(); ghSoon(); return Promise.resolve(true); }
-      const entry = { op: 'app', coll: 'desk', id: 'main', doc: null };
-      const go = () => { appTimer = null; entry.doc = clean(S.app); if (st.mode === 'loading') { addOutbox('desk/main', entry); return Promise.resolve(true); } return enqueue('desk/main', () => db.doc('desk/main').set(clean(S.app)), entry); };
+      const go = () => {
+        appTimer = null;
+        const entry = { op: 'app', coll: 'desk', id: 'main', doc: clean(S.app), seq: stamp() };
+        addOutbox('desk/main', entry);
+        if (st.mode !== 'cloud') return Promise.resolve(st.mode === 'loading');
+        return cloudWrite('desk/main', entry);
+      };
       clearTimeout(appTimer);
       if (now) return go();
       appTimer = setTimeout(go, 450);
@@ -1774,14 +1895,22 @@ details > summary { cursor: pointer; font-weight: 600; }
     function flushOutbox() {
       if (st.mode !== 'cloud') return;
       for (const [key, e] of Object.entries(outbox)) {
-        if (queues.has(key) && inflight.has(key)) continue;
-        if (e.op === 'app') enqueue('desk/main', () => db.doc('desk/main').set(e.doc), e);
-        else enqueue(key, () => (e.op === 'put' ? db.collection(e.coll).doc(e.id).set(e.doc) : db.collection(e.coll).doc(e.id).delete()), e);
+        if (inflight.has(key)) continue;
+        cloudWrite(key, Object.assign(e, { replay: true }));
       }
     }
+    // local mode: merge with what another tab may have saved, then write
     function saveLocal() {
       if (st.mode !== 'local') return;
-      const ok = lsSet(LS.local, snapshotAll()) && lsSet(LS.tomb, tomb);
+      let cur = Object.assign(snapshotAll(), { tomb });
+      const disk = lsGet(LS.local);
+      if (disk) {
+        const merged = mergeData(cur, Object.assign({}, disk, { tomb: lsGet(LS.tomb) || {} }));
+        if (sig(canon(merged)) !== sig(canon(cur))) { hydrate(merged); setTimeout(notify, 0); }
+        tomb = merged.tomb;
+        cur = merged;
+      }
+      const ok = lsSet(LS.local, { app: cur.app, trades: cur.trades, days: cur.days, events: cur.events }) && lsSet(LS.tomb, tomb);
       if (!ok) H.toast('This browser refused to save. Download a backup from Setup now.', 6000);
     }
     function cacheSoon() {
@@ -1798,8 +1927,20 @@ details > summary { cursor: pointer; font-weight: 600; }
       }
       const id = uid('img_');
       await idbPut(id, blob);
-      if (st.gh) { const q = lsGet(LS.imgq) || []; q.push(id); lsSet(LS.imgq, q); ghSoon(); }
+      if (st.gh) { queueImages([id]); ghSoon(); }
       return { id, src: 'local' };
+    }
+    function queueImages(ids) {
+      const done = new Set(lsGet(LS.imgdone) || []);
+      const q = new Set(lsGet(LS.imgq) || []);
+      for (const id of ids) if (!done.has(id)) q.add(id);
+      lsSet(LS.imgq, [...q]);
+    }
+    // screenshots saved before sync was switched on still need uploading
+    function queueLocalShots() {
+      const ids = [];
+      for (const t of S.trades.values()) for (const s of t.shots || []) if (s && s.id && (s.src === 'local' || !s.src)) ids.push(s.id);
+      queueImages(ids);
     }
     async function imageUrl(shot) {
       if (!shot || !shot.id) return null;
@@ -1860,7 +2001,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     }
     async function ghPutData(data, sha) {
       const g = st.gh;
-      const body = { message: 'Journal sync ' + nowIso(), content: textToB64(JSON.stringify(data)) };
+      const body = { message: 'Journal sync ' + new Date().toISOString(), content: textToB64(JSON.stringify(data)) };
       if (sha) body.sha = sha;
       const r = await ghFetch(`/repos/${g.repo}/contents/${DATA_FILE}`, { method: 'PUT', body: JSON.stringify(body) });
       if (r.status === 409 || r.status === 422) { const e = await ghErr(r); e.conflict = true; throw e; }
@@ -1869,17 +2010,24 @@ details > summary { cursor: pointer; font-weight: 600; }
     }
     async function ghPushImages() {
       const q = lsGet(LS.imgq) || [];
-      const left = [];
+      if (!q.length) return;
+      const finished = new Set();
       for (const id of q) {
         try {
-          const blob = await idbGet(id);
-          if (!blob) continue;
+          let blob = null;
+          try { blob = await idbGet(id); } catch (e) { blob = null; }
+          if (!blob) { finished.add(id); continue; }
           const b64 = bytesToB64(new Uint8Array(await blob.arrayBuffer()));
           const r = await ghFetch(`/repos/${st.gh.repo}/contents/shots/${id}.jpg`, { method: 'PUT', body: JSON.stringify({ message: 'Screenshot ' + id, content: b64 }) });
-          if (!r.ok && r.status !== 422) left.push(id);
-        } catch (e) { left.push(id); }
+          if (r.ok || r.status === 422) finished.add(id);
+        } catch (e) { /* stays queued */ }
       }
-      lsSet(LS.imgq, left);
+      // re-read: shots queued while this pass ran must stay queued
+      const cur = lsGet(LS.imgq) || [];
+      lsSet(LS.imgq, cur.filter((id) => !finished.has(id)));
+      const done = new Set(lsGet(LS.imgdone) || []);
+      for (const id of finished) done.add(id);
+      lsSet(LS.imgdone, [...done].slice(-5000));
     }
     function ghSoon() {
       if (!st.gh || st.mode !== 'local') return;
@@ -1895,28 +2043,28 @@ details > summary { cursor: pointer; font-weight: 600; }
           const remote = await ghGetData();
           const local = Object.assign(snapshotAll(), { tomb });
           const merged = mergeData(local, remote.data);
-          if (sig(merged) !== sig(local)) {
-            hydrate(merged);
-            tomb = merged.tomb;
-            saveLocal();
-            notify();
-          } else tomb = merged.tomb;
-          if (remote.data && sig(merged) === sig(remote.data)) break;
+          const cm = sig(canon(merged));
+          tomb = merged.tomb;
+          if (cm !== sig(canon(local))) { hydrate(merged); notify(); }
+          saveLocal();
+          if (remote.data && cm === sig(canon(remote.data))) break;
           try {
-            await ghPutData(Object.assign({ format: 'vanguard-desk', version: 1, saved: nowIso() }, clean(merged)), remote.sha);
+            await ghPutData(Object.assign({ format: 'vanguard-desk', version: 1, saved: new Date().toISOString() }, clean(Object.assign(snapshotAll(), { tomb }))), remote.sha);
             break;
           } catch (e) {
             if (e.conflict && attempt < 3) { await sleep(jitter(300, 1200)); continue; }
             throw e;
           }
         }
+        lsSet(LS.ghrepo, st.gh.repo);
+        queueLocalShots();
         await ghPushImages();
         st.ghState = 'ok'; st.ghLast = Date.now(); st.ghError = null;
         return true;
       } catch (e) {
         st.ghState = 'error';
-        st.ghError = e.status === 401 ? 'GitHub rejected the token. It may have expired: create a new one and connect again.'
-          : e.status === 403 ? 'The token can’t write to that repository. Give it Contents: Read and write.'
+        st.ghError = e.status === 401 ? 'GitHub rejected the token; it has probably expired. Make a new token, then paste it under Setup › Sync with GitHub › Replace token. Your entries are safe in this browser.'
+          : e.status === 403 ? 'The token can’t write to that repository. Give it Contents: Read and write, then replace it in Setup.'
             : e.status === 404 ? 'Repository not found. Check the name (owner/repo) and that the token can see it.'
               : (e.message || 'Sync failed.');
         return false;
@@ -1924,6 +2072,42 @@ details > summary { cursor: pointer; font-weight: 600; }
         ghBusy = false; notify();
         if (ghAgain) { ghAgain = false; setTimeout(() => ghSync('again'), 800); }
       }
+    }
+    // the first sync of a device that already has its own journal: the synced copy is the base,
+    // and this device's accounts are matched onto the synced ones (same account # or same name and size)
+    function adoptRemote(remote) {
+      if (!remote || !remote.data || !remote.data.app) return null;
+      const hasData = COLLS.some((c) => S[c].size > 0);
+      if (!hasData) { S.app = null; tomb = {}; return 'adopted'; }
+      const rApp = H.migrateApp(remote.data.app);
+      const map = {};
+      for (const la of (S.app ? S.app.accounts : [])) {
+        if (rApp.accounts.some((r) => r.id === la.id)) continue;
+        const m = rApp.accounts.find((r) => la.platformId && r.platformId === la.platformId)
+          || rApp.accounts.find((r) => r.name === la.name && +r.size === +la.size && r.program === la.program);
+        if (m) map[la.id] = m.id;
+      }
+      let moved = 0;
+      for (const c of COLLS) {
+        for (const [id, x] of [...S[c]]) {
+          if (!map[x.acc]) continue;
+          const y = Object.assign({}, x, { acc: map[x.acc] });
+          if (c === 'days') {
+            y.id = y.acc + '_' + y.day;
+            S.days.delete(id); tomb['days/' + id] = stamp(x.updated);
+          }
+          y.updated = stamp(x.updated);
+          S[c].set(y.id, y);
+          if (c === 'trades') moved++;
+        }
+      }
+      for (const id of Object.keys(map)) tomb['accounts/' + id] = stamp();
+      const extra = (S.app ? S.app.accounts : []).filter((a) => !map[a.id] && !rApp.accounts.some((r) => r.id === a.id));
+      rApp.accounts = rApp.accounts.concat(extra);
+      rApp.updated = stamp(rApp.updated);
+      S.app = rApp;
+      saveLocal();
+      return moved ? `moved ${moved}` : 'merged';
     }
     async function ghConnect(repo, token) {
       repo = String(repo || '').trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/$/, '');
@@ -1937,10 +2121,17 @@ details > summary { cursor: pointer; font-weight: 600; }
         if (!r.ok) throw await ghErr(r);
         const j = await r.json();
         if (j.private === false) { st.gh = prev; return { ok: false, msg: 'That repository is public. Use a private repository so your journal stays private.' }; }
+        let note = '';
+        if (lsGet(LS.ghrepo) !== repo) {
+          const res = adoptRemote(await ghGetData());
+          if (res && res.startsWith('moved')) note = ` Your ${res.slice(6)} trade(s) from this device were added to the matching account.`;
+        }
         lsSet(LS.gh, st.gh);
         st.ghState = 'idle';
+        startPoll();
+        queueLocalShots();
         const ok = await ghSync('connect');
-        return ok ? { ok: true, msg: 'Connected. This device now syncs with GitHub.' } : { ok: false, msg: st.ghError || 'Connected, but the first sync failed.' };
+        return ok ? { ok: true, msg: 'Connected. This device now syncs with GitHub.' + note } : { ok: false, msg: st.ghError || 'Connected, but the first sync failed.' };
       } catch (e) {
         st.gh = prev;
         return { ok: false, msg: e.status === 401 ? 'GitHub rejected that token.' : e.status === 404 ? 'GitHub can’t find that repository with this token.' : (e.message || 'Could not reach GitHub.') };
@@ -1952,8 +2143,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     async function mergeLocalIntoCloud(local) {
       const res = { trades: { ok: 0, failed: 0 }, days: { ok: 0, failed: 0 }, events: { ok: 0, failed: 0 } };
       if (local.app) {
-        if (!S.app) S.app = H.migrateApp(local.app);
-        else for (const acc of H.migrateApp(local.app).accounts) if (!S.app.accounts.find((x) => x.id === acc.id)) S.app.accounts.push(acc);
+        S.app = S.app ? H.migrateApp(mergeApp(S.app, H.migrateApp(local.app))) : H.migrateApp(local.app);
         await saveApp(true);
       }
       for (const c of COLLS) {
@@ -1967,12 +2157,12 @@ details > summary { cursor: pointer; font-weight: 600; }
 
     return {
       st, init, put, del, putMany, delMany, saveApp, flushOutbox, cacheSoon, snapshotAll, mergeLocalIntoCloud,
-      saveImage, imageUrl, deleteImage, ghConnect, ghDisconnect, ghSync, sanitizeList,
+      saveImage, imageUrl, deleteImage, ghConnect, ghDisconnect, ghSync, sanitizeList, stamp,
       get mode() { return st.mode; },
     };
   }
 
-  window.DeskStore = { create, mergeData };
+  window.DeskStore = { create, mergeData, mergeApp, mergeDay };
 })();
 
 </script>
@@ -2139,6 +2329,7 @@ details > summary { cursor: pointer; font-weight: 600; }
       const mood = numF(d.mood);
       if (mood >= 1 && mood <= 5) o.mood = Math.round(mood);
       if (d.checks && typeof d.checks === 'object') { o.checks = {}; for (const [k, v] of Object.entries(d.checks).slice(0, 60)) o.checks[str(k, 200)] = !!v; }
+      if (d.fu && typeof d.fu === 'object') { o.fu = {}; for (const [k, v] of Object.entries(d.fu).slice(0, 120)) if (isoOk(v)) o.fu[str(k, 220)] = v; }
       return o;
     }
     if (coll === 'events') {
@@ -2174,10 +2365,13 @@ details > summary { cursor: pointer; font-weight: 600; }
   const ro = () => Store.st.readOnly;
 
   /* ================= derived ================= */
+  // the account being viewed is a per-device choice; switching on the phone never switches the computer
   function activeAccount() {
     if (!S.app) return null;
-    return S.app.accounts.find((a) => a.id === S.app.activeId) || S.app.accounts[0] || null;
+    const accs = S.app.accounts;
+    return accs.find((a) => a.id === S.ui.activeId) || accs.find((a) => a.id === S.app.activeId) || accs[0] || null;
   }
+  function selectAccount(id) { S.ui.activeId = id; saveUi(); resetFilters(); memo = null; }
   let memo = null;
   function ctx() {
     const acc = activeAccount();
@@ -2192,11 +2386,20 @@ details > summary { cursor: pointer; font-weight: 600; }
     const now = Date.now();
     const L = E.buildLedger(acc, trades, events, dayDocs, set, now);
     const todayDoc = dayDocs[L.today] || {};
-    const R = E.riskNow(L, todayDoc.openPnl);
+    // an open position held through 5 PM ET: last session's open P&L carries over until a trade closes.
+    // A carried loss counts against today's room; a carried profit is not trusted as extra room.
+    let openUsed = fin(todayDoc.openPnl) ? +todayDoc.openPnl : null;
+    let carried = null;
+    const prevDoc = dayDocs[E.prevTradingDay(L.today)] || {};
+    if (openUsed == null && fin(prevDoc.openPnl) && isoOk(prevDoc.openPnlAt)) {
+      const since = Date.parse(prevDoc.openPnlAt);
+      if (!trades.some((t) => Date.parse(t.closeTs || t.openTs || 0) > since)) { carried = +prevDoc.openPnl; openUsed = Math.min(0, carried); }
+    }
+    const R = E.riskNow(L, openUsed);
     const P = E.payoutStatus(L, acc, events, now);
     const calcById = new Map(trades.map((t) => [t.id, E.tradeCalc(t, set)]));
     const I = E.inactivity ? E.inactivity(L, acc, now) : null;
-    const c = { acc, set, trades, events, dayDocs, L, R, P, I, todayDoc, calcById };
+    const c = { acc, set, trades, events, dayDocs, L, R, P, I, todayDoc, calcById, openUsed, carried };
     c.status = deskStatus(c);
     memo = { key: S._ver, minute, acc: acc.id, c };
     return c;
@@ -2247,11 +2450,23 @@ details > summary { cursor: pointer; font-weight: 600; }
     if (typingInMain() || pointerDown) { renderPending = true; return; }
     if (renderPending === 'raf') return;
     renderPending = 'raf';
-    requestAnimationFrame(() => { renderPending = false; render(); });
+    // animation frames pause in background tabs; the timer makes sure a redraw still happens
+    let done = false;
+    const run = () => { if (done) return; done = true; if (renderPending === 'raf') renderPending = false; render(); };
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
   }
   function flushRender() { if (renderPending === true && !typingInMain() && !pointerDown) { renderPending = false; scheduleRender(); } }
-  document.addEventListener('pointerdown', () => { pointerDown = true; setTimeout(() => { if (pointerDown) { pointerDown = false; flushRender(); } }, 900); }, true);
-  document.addEventListener('pointerup', () => { setTimeout(() => { pointerDown = false; flushRender(); }, 0); });
+  let pressSeq = 0, pressTimer = 0;
+  document.addEventListener('pointerdown', () => {
+    pointerDown = true;
+    const my = ++pressSeq;
+    clearTimeout(pressTimer);
+    pressTimer = setTimeout(() => { if (pointerDown && my === pressSeq) { pointerDown = false; flushRender(); } }, 900);
+  }, true);
+  const release = () => { clearTimeout(pressTimer); setTimeout(() => { pointerDown = false; flushRender(); }, 0); };
+  document.addEventListener('pointerup', release);
+  document.addEventListener('pointercancel', release);
   document.addEventListener('focusout', () => { setTimeout(flushRender, 0); });
 
   function render() {
@@ -2297,7 +2512,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     $('#brand-name').textContent = acc ? `${acc.name} Desk` : 'Vanguard 25K Desk';
     if (S.app && S.app.accounts.length > 1) {
       sw.hidden = false;
-      sw.innerHTML = S.app.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === S.app.activeId ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
+      sw.innerHTML = S.app.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === acc.id ? 'selected' : ''}>${esc(a.name)}${a.platformId ? ' #' + esc(a.platformId) : ''}</option>`).join('');
     } else sw.hidden = true;
     const pill = $('#status-pill');
     const c = acc ? ctx() : null;
@@ -2342,8 +2557,11 @@ details > summary { cursor: pointer; font-weight: 600; }
       const n = (S.flags.pendingLocal.trades || []).length;
       out.push(`<div class="banner info"><span>Found <b>${plural(n, 'trade')}</b> saved only in this browser from an earlier visit.</span><span class="row"><button class="btn sm primary" data-action="merge-local">Add them to my synced journal</button><button class="btn sm ghost" data-action="dismiss-local">Not now</button></span></div>`);
     }
-    if (st.mode === 'local' && !st.gh && !S.ui.hideLocalTip) out.push(`<div class="banner info"><span>Your journal saves in this browser. To use it on your phone and computer, turn on GitHub sync in Setup. Download a backup each week either way.</span><span class="row"><button class="btn sm" data-tab-go="setup">Set up sync</button><button class="btn sm ghost" data-action="hide-local-tip">Hide</button></span></div>`);
-    if (st.mode === 'local' && st.gh && st.ghState === 'error') out.push(`<div class="banner warn"><span><b>GitHub sync failed:</b> ${esc(st.ghError || '')} Your entries are safe in this browser.</span><button class="btn sm" data-action="gh-sync">Try again</button></div>`);
+    const lastBackup = lsGet('v25k.lastBackup');
+    const backupAge = lastBackup ? Date.now() - Date.parse(lastBackup) : Infinity;
+    if (st.mode === 'local' && !st.gh && c && c.trades.length && backupAge > 7 * E.DAY) out.push(`<div class="banner warn"><span><b>${lastBackup ? 'Last backup ' + fmtDur(backupAge) + ' ago.' : 'No backup yet.'}</b> Your journal lives only in this browser, which can clear it. Download a backup, or turn on GitHub sync.</span><span class="row"><button class="btn sm primary" data-action="export-json">Download backup</button><button class="btn sm" data-tab-go="setup">Set up sync</button></span></div>`);
+    if (st.mode === 'local' && !st.gh && !(S.ui.hideLocalTipAt && Date.now() - Date.parse(S.ui.hideLocalTipAt) < 7 * E.DAY) && !(c && c.trades.length && backupAge > 7 * E.DAY)) out.push(`<div class="banner info"><span>Your journal saves in this browser. To use it on your phone and computer, turn on GitHub sync in Setup. Download a backup each week either way.</span><span class="row"><button class="btn sm" data-tab-go="setup">Set up sync</button><button class="btn sm ghost" data-action="hide-local-tip">Hide</button></span></div>`);
+    if (st.mode === 'local' && st.gh && st.ghState === 'error') out.push(`<div class="banner warn"><span><b>GitHub sync failed:</b> ${esc(st.ghError || '')}</span><span class="row"><button class="btn sm" data-action="gh-sync">Try again</button><button class="btn sm" data-tab-go="setup">Fix in Setup</button></span></div>`);
     if (st.readOnly && st.mode !== 'offline') out.push(`<div class="banner warn"><span>You can view this desk but not change it.</span></div>`);
     if (c) {
       const ia = inactivityText(c);
@@ -2357,7 +2575,7 @@ details > summary { cursor: pointer; font-weight: 600; }
   /* ================= TODAY ================= */
   function viewToday(c) {
     const t = c.L.todayRow, R = c.R, st = c.status, r = c.set.risk, rules = c.acc.rules;
-    const dailyUsed = Math.max(0, t.startBal - R.equity);
+    const dailyUsed = Math.max(0, (fin(t.snapshot) ? t.snapshot : t.startBal) - R.equity);
     const trailDist = R.equity - R.floor;
     const tt = todayTrades(c);
     const doc = c.todayDoc;
@@ -2369,6 +2587,9 @@ details > summary { cursor: pointer; font-weight: 600; }
     const reasons = st.reasons.length ? `<ul>${st.reasons.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : `<div class="small" style="margin-top:2px">Every limit has room. Size each trade on the calculator first.</div>`;
     const marketNote = st.market === 'weekend' ? `<div class="verdict info">Market is closed for the weekend. Futures reopen Sunday 6:00 PM ET.</div>` : st.weekendNote ? `<div class="verdict info">${esc(st.weekendNote)}</div>` : '';
     const openAge = fin(doc.openPnl) && doc.openPnlAt ? Date.now() - Date.parse(doc.openPnlAt) : null;
+    // the sign toggle always reflects the saved value, so editing the number can't flip it
+    const openUp = fin(doc.openPnl) ? doc.openPnl >= 0 : c.carried != null ? c.carried >= 0 : S.ui.openUp !== false;
+    const daysReq = P.reqs.find((x) => x.key === 'days');
     const dlTyped = fin(doc.dailyLimit);
     const reqs = P.reqs.filter((x) => !x.manual && !x.info);
     return `
@@ -2377,12 +2598,12 @@ details > summary { cursor: pointer; font-weight: 600; }
       <div class="room">
         <span class="eyebrow">Room before a breach · ${esc(fmtDay(c.L.today))} session</span>
         <div class="big ${st.level}">${money(R.room)}</div>
-        <div class="small muted">Equity <b class="num">${money(R.equity)}</b>${fin(doc.openPnl) ? ` (incl. ${smoney(doc.openPnl)} open)` : ''} · hard floor <b class="num">${money(R.floorAbs)}</b> set by the ${R.binding === 'daily' ? 'daily drawdown' : 'trailing drawdown'}</div>
+        <div class="small muted">Equity <b class="num">${money(R.equity)}</b>${c.openUsed ? ` (incl. ${smoney(c.openUsed)} open${c.carried != null ? ', carried from last session' : ''})` : ''} · hard floor <b class="num">${money(R.floorAbs)}</b> set by the ${R.binding === 'daily' ? 'daily drawdown' : 'trailing drawdown'}</div>
         <div class="verdict ${st.level}"><b>${esc(st.title)}</b>${reasons}</div>
         ${marketNote}
       </div>
       <div class="meters">
-        ${meter({ label: 'Daily drawdown', right: `${money(dailyUsed)} of ${money(R.allowance)} used`, used: dailyUsed, of: R.allowance, cls: dailyUsed >= R.allowance * 0.75 ? 'bad' : dailyUsed >= R.allowance * 0.4 ? 'warn' : '', sub: `Limit today <b class="num">${money(t.dailyLimit)}</b> · ${esc(rules.dailyPct)}% below the 5 PM ET balance${dlTyped ? (t.dailyLimit > t.dailyCalc ? ' (your dashboard figure, tighter)' : ' (the computed figure is tighter than the one you typed)') : ''}${t.payoutToday ? ` · lowered by today's ${money0(t.payoutToday)} payout` : ''}` })}
+        ${meter({ label: 'Daily drawdown', right: `${money(dailyUsed)} of ${money(R.allowance)} used`, used: dailyUsed, of: R.allowance, cls: dailyUsed >= R.allowance * 0.75 ? 'bad' : dailyUsed >= R.allowance * 0.4 ? 'warn' : '', sub: `Limit today <b class="num">${money(t.dailyLimit)}</b> · ${esc(rules.dailyPct)}% below the higher of balance or equity at 5 PM ET${t.carriedOpen > 0 ? ` (includes the ${money0(t.carriedOpen)} open profit you held through the reset)` : ''}${dlTyped ? (t.dailyLimit > t.dailyCalc ? ' (your dashboard figure, tighter)' : ' (the computed figure is tighter than the one you typed)') : ''}${t.payoutToday ? ` · lowered by today's ${money0(t.payoutToday)} payout` : ''}` })}
         ${meter({ label: 'Trailing drawdown', right: `${money(trailDist)} above the floor`, used: Math.max(0, c.L.trailAmt - trailDist), of: c.L.trailAmt, cls: trailDist < c.L.mtl ? 'bad' : trailDist < c.L.trailAmt * 0.6 ? 'warn' : '', sub: c.L.locked ? `Floor <b class="num">${money(R.floor)}</b> · locked for good` : `Floor <b class="num">${money(R.floor)}</b> · ${rules.trailingMode === 'eod' ? 'rises with your best end-of-day balance' : 'rises with your best balance, open profit included'}, stops at <b class="num">${money(c.L.lockLevel)}</b>` })}
         ${+r.dailyStop > 0 ? meter({ label: 'Your daily stop', right: `${money(Math.max(0, -t.net))} of ${money(r.dailyStop)}`, used: Math.max(0, -t.net), of: +r.dailyStop, cls: -t.net >= r.dailyStop ? 'bad' : -t.net >= r.dailyStop / 2 ? 'warn' : 'acc', sub: 'Your own limit, tighter than the account rule. Change it in Setup.' }) : ''}
         <div class="row small">
@@ -2398,7 +2619,7 @@ details > summary { cursor: pointer; font-weight: 600; }
       <div class="kpi"><div class="eyebrow">Today</div><div class="v ${tone(t.net)}">${smoney(t.net)}</div><div class="s">${plural(t.n, 'trade')} · ${t.wins}W ${t.losses}L</div></div>
       <div class="kpi"><div class="eyebrow">Balance</div><div class="v">${money(c.L.balance)}</div><div class="s">${smoney(c.L.balance - c.acc.size)} since start</div></div>
       <div class="kpi"><div class="eyebrow">Floor after today</div><div class="v">${money(c.L.nextFloor)}</div><div class="s">if you end the day here</div></div>
-      <div class="kpi"><div class="eyebrow">Payout</div><div class="v">${P.eligible ? '<span class="good">Ready</span>' : `${reqs.filter((x) => x.met).length} / ${reqs.length}`}</div><div class="s">${P.first ? `${P.qualDays.length}/${esc(rules.firstPayoutDays)} days of ${money0(c.L.qualMin)}+` : 'rules met'}</div></div>
+      <div class="kpi"><div class="eyebrow">Payout</div><div class="v">${P.eligible ? '<span class="good">Ready</span>' : `${reqs.filter((x) => x.met).length} / ${reqs.length}`}</div><div class="s">${P.first && daysReq ? `${esc(daysReq.have)}/${esc(daysReq.need)} days of ${money0(c.L.qualMin)}+` : 'rules met'}</div></div>
     </div>
 
     <div class="split">
@@ -2421,9 +2642,9 @@ details > summary { cursor: pointer; font-weight: 600; }
       <div class="card-h"><h2>Open position and dashboard numbers</h2><span class="tiny muted">Optional. Upcomers X shows live equity; the dashboard can lag.</span></div>
       <div class="grid g4">
         <div class="field"><span>Open P&amp;L right now</span>
-          <div class="row" style="gap:6px;flex-wrap:nowrap"><div class="seg" role="group" aria-label="Open P&amp;L sign"><button type="button" data-open-sign="up" aria-pressed="${!(fin(doc.openPnl) && doc.openPnl < 0) && S.ui.openUp !== false}">Up</button><button type="button" data-open-sign="down" aria-pressed="${(fin(doc.openPnl) && doc.openPnl < 0) || (!fin(doc.openPnl) && S.ui.openUp === false)}">Down</button></div>
-          <input id="d-open" inputmode="decimal" value="${fin(doc.openPnl) ? Math.abs(doc.openPnl) : ''}" placeholder="0.00" style="min-width:0"></div>
-          <span class="hint">${fin(doc.openPnl) ? `${openAge != null && openAge > 15 * 60000 ? '<b class="warn">Entered ' + fmtDur(openAge) + ' ago. Update or clear it.</b>' : 'Counts toward equity and the room above.'} <button class="btn ghost sm" data-action="clear-open" style="padding:0 4px">Clear</button>` : 'Counts toward equity. Clears itself when you log a trade.'}</span></div>
+          <div class="row" style="gap:6px;flex-wrap:nowrap"><div class="seg" role="group" aria-label="Open P&amp;L sign"><button type="button" data-open-sign="up" aria-pressed="${openUp}">Up</button><button type="button" data-open-sign="down" aria-pressed="${!openUp}">Down</button></div>
+          <input id="d-open" inputmode="decimal" value="${fin(doc.openPnl) ? Math.abs(doc.openPnl) : ''}" placeholder="${c.carried != null ? Math.abs(c.carried).toFixed(2) : '0.00'}" style="min-width:0"></div>
+          <span class="hint">${fin(doc.openPnl) ? `${openAge != null && openAge > 15 * 60000 ? '<b class="warn">Entered ' + fmtDur(openAge) + ' ago. Update or clear it.</b>' : 'Counts toward equity and the room above.'} <button class="btn ghost sm" data-action="clear-open" style="padding:0 4px">Clear</button>` : c.carried != null ? `<b class="warn">Carried from last session: ${smoney(c.carried)}.</b> Still open? Type its open P&amp;L now. ${c.carried < 0 ? 'Until then the loss counts against today.' : 'A carried profit is not counted as room.'} <button class="btn ghost sm" data-action="clear-carried" style="padding:0 4px">It's closed</button>` : 'Counts toward equity. Clears itself when you log a trade.'}</span></div>
         <label class="field"><span>Daily DD limit on dashboard</span><input id="d-dl" inputmode="decimal" data-day-field="dailyLimit" value="${dlTyped ? esc(doc.dailyLimit) : ''}" placeholder="${t.dailyCalc.toFixed(2)}"><span class="hint">The app uses the tighter of this and ${money(t.dailyCalc)}.</span></label>
         <label class="field"><span>HWM on dashboard</span><input id="d-hwm" inputmode="decimal" data-day-field="hwm" value="${fin(doc.hwm) ? esc(doc.hwm) : ''}" placeholder="${Math.max(c.L.peak || 0, c.L.maxEod).toFixed(2)}"><span class="hint">Floor = HWM − ${money0(c.L.trailAmt)}, up to ${money0(c.L.lockLevel)}. Only ever raises the floor.</span></label>
         <label class="field"><span>Balance on dashboard</span><input id="d-bal" inputmode="decimal" placeholder="${c.L.balance.toFixed(2)}"><span class="hint" id="d-bal-hint">Compare with the journal balance.</span></label>
@@ -2468,7 +2689,8 @@ details > summary { cursor: pointer; font-weight: 600; }
           <label class="field"><span>Target distance (ticks)</span><input id="c-targetticks" inputmode="decimal" data-calc="targetTicks" value="${esc(k.targetTicks)}" placeholder="optional"></label>
         </div>
         <label class="field"><span>Your risk for this trade ($)</span><input id="c-budget" inputmode="decimal" data-calc="budget" value="${esc(k.budget)}" placeholder="${esc(r.perTrade)}"><span class="hint">Default ${money0(r.perTrade)} from Setup. The account allows up to ${money0(c.L.mtl)} per position.</span></label>
-        <details ${k.openMinis || k.openMicros || k.sameRisk || k.otherRisk ? 'open' : ''}>
+        ${c.openUsed ? `<div class="banner warn small"><span>Today shows an open position (${smoney(c.openUsed)}). ${c.openUsed < 0 ? `Its ${money(-c.openUsed)} loss is already taken off your room.` : ''} Enter its loss to the stop below so the calculator counts it fully.</span></div>` : ''}
+        <details ${k.openMinis || k.openMicros || k.sameRisk || k.otherRisk || c.openUsed ? 'open' : ''}>
           <summary>Already in a trade? Slippage, fees, open positions</summary>
           <div class="grid g3" style="margin-top:10px">
             <label class="field"><span>Already open: minis</span><input id="c-ominis" inputmode="decimal" data-calc="openMinis" value="${esc(k.openMinis)}" placeholder="0"></label>
@@ -2492,7 +2714,9 @@ details > summary { cursor: pointer; font-weight: 600; }
     const k = S.ui.calc, r = c.set.risk;
     const v = (x, d) => (numOrNull(x) == null ? d : Math.max(0, numOrNull(x)));
     const sameRisk = v(k.sameRisk, 0), otherRisk = v(k.otherRisk, 0);
-    const openRisk = sameRisk + otherRisk;
+    // a known open loss is at least that far from its stop, so it always counts against the rooms
+    const openLoss = Math.max(0, -(c.openUsed || 0));
+    const openRisk = Math.max(sameRisk + otherRisk, openLoss);
     const todayNet = c.L.todayRow.net;
     // rooms are measured from the balance: if the open stops hit, open profit or loss turns into the stop loss
     const dailyRoom = c.L.balance - c.L.todayRow.dailyLimit;
@@ -2560,8 +2784,8 @@ details > summary { cursor: pointer; font-weight: 600; }
     const ladder = s.ladder && s.ladder.length ? `
       <section class="card">
         <div class="card-h"><h3>Widest stop for each size</h3><span class="tiny muted">${lb != null ? `stays under ${money(lb)} (${esc(s.ladderBindingLabel || 'your tightest limit')}) incl. slippage and fees` : ''}</span></div>
-        <div class="tw"><table class="t"><thead><tr><th>Contracts</th><th class="r">Ticks</th><th class="r">Points</th>${s.ladder[0].price != null ? '<th class="r">Stop price</th>' : ''}<th class="r">Loss at stop</th></tr></thead>
-        <tbody>${s.ladder.map((row) => `<tr class="${row.n === s.qty ? 'hl' : ''}"><td class="num">${row.n} ${esc(i.sym)}</td><td class="r num">${row.ticks}</td><td class="r num">${row.points}</td>${row.price != null ? `<td class="r num">${pxFmt(row.price, i.sym)}</td>` : ''}<td class="r num">${money(row.dollars)}</td></tr>`).join('')}</tbody></table></div>
+        <div class="tw"><table class="t"><thead><tr><th>Contracts</th><th class="r">Ticks</th><th class="r">Points</th>${s.ladder[0].price != null ? '<th class="r">Stop price</th>' : ''}<th class="r">Loss if stopped</th></tr></thead>
+        <tbody>${s.ladder.map((row) => `<tr class="${row.n === s.qty ? 'hl' : ''}"><td class="num">${row.n} ${esc(i.sym)}</td><td class="r num">${row.ticks}</td><td class="r num">${row.points}</td>${row.price != null ? `<td class="r num">${pxFmt(row.price, i.sym)}</td>` : ''}<td class="r num">${money(fin(row.worst) ? row.worst : row.dollars)}</td></tr>`).join('')}</tbody></table></div>
       </section>` : '';
     out.innerHTML = `
       <section class="answer ${s.qty ? '' : 'zero'}">
@@ -2663,7 +2887,7 @@ details > summary { cursor: pointer; font-weight: 600; }
       <div class="quick">
         <label class="field"><span>Instrument</span><select id="q-sym">${instOptions(qi.sym)}</select></label>
         <div class="field"><span>Side</span><div class="seg long-short" role="group" aria-label="Side"><button type="button" data-q-side="long" data-v="long" aria-pressed="${u.qSide !== 'short'}">Long</button><button type="button" data-q-side="short" data-v="short" aria-pressed="${u.qSide === 'short'}">Short</button></div></div>
-        <label class="field"><span>Contracts</span><input id="q-qty" inputmode="numeric" value="1"></label>
+        <label class="field"><span>Contracts</span><input id="q-qty" inputmode="numeric" value="${esc(S.ui.qQty || 1)}"></label>
         <div class="field"><span>Net P&amp;L ($)</span><div class="row" style="gap:6px;flex-wrap:nowrap"><div class="seg" role="group" aria-label="Win or loss"><button type="button" data-q-win="1" aria-pressed="${u.qWin !== false}">Win</button><button type="button" data-q-win="0" aria-pressed="${u.qWin === false}">Loss</button></div><input id="q-net" inputmode="decimal" placeholder="62.50" style="min-width:0"></div></div>
         <button class="btn primary" data-action="quick-add">Add</button>
       </div>
@@ -2929,7 +3153,12 @@ details > summary { cursor: pointer; font-weight: 600; }
       return `<section class="card stack" id="sync"><div class="card-h" style="margin:0"><h2>Sync with GitHub</h2><span class="pill ${st.ghState === 'error' ? 'stop' : 'clear'}"><i></i>${st.ghState === 'error' ? 'Sync failed' : st.ghState === 'syncing' ? 'Syncing' : 'On'}</span></div>
         <p class="small">This browser syncs your journal with <b>${esc(st.gh.repo)}</b>${st.ghLast ? `, last at ${esc(fmtTime(st.ghLast))}` : ''}. Every sync is saved as a commit, so GitHub also keeps your full history.</p>
         ${st.ghError ? `<div class="banner warn small">${esc(st.ghError)}</div>` : ''}
-        <div class="row"><button class="btn sm" data-action="gh-sync">Sync now</button><button class="btn sm danger" data-action="gh-disconnect">Turn off on this device</button></div>
+        <div class="row"><button class="btn sm" data-action="gh-sync">Sync now</button></div>
+        <details ${st.ghState === 'error' ? 'open' : ''}><summary class="small">Replace token (when it expires)</summary>
+          <div class="row" style="margin-top:8px"><input class="inp" id="gh-token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…" style="flex:1;min-width:200px"><button class="btn sm primary" data-action="gh-replace">Save new token</button></div>
+          <p class="tiny muted" style="margin-top:6px">Make it the same way as before at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>. <span id="gh-msg"></span></p>
+        </details>
+        <div class="row"><button class="btn sm ghost" data-action="gh-disconnect">Turn off sync on this device</button></div>
         <p class="tiny muted">Turning off keeps everything in this browser and in GitHub; it only stops syncing here.</p></section>`;
     }
     return `<section class="card stack" id="sync"><h2>Use it on your phone and computer</h2>
@@ -2944,7 +3173,7 @@ details > summary { cursor: pointer; font-weight: 600; }
         <label class="field"><span>Token</span><input id="gh-token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>
       </div>
       <div class="row"><button class="btn primary sm" data-action="gh-connect">Connect</button><span class="small" id="gh-msg"></span></div>
-      <p class="tiny muted">Only connect on your own devices. Anyone who can use this browser profile can use the token, and it can only reach the one repository you picked.</p></section>`;
+      <p class="tiny muted">Only connect on your own devices. The token stays in this browser and can only reach the one repository you picked. Pages you publish yourself on the same github.io address can read this browser's storage for that address, so don't add pages you don't trust there.</p></section>`;
   }
   function viewSetup(c) {
     const a = c.acc, R = a.rules, set = c.set, r = set.risk;
@@ -3010,7 +3239,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     </div>
     <section class="card stack">
       <h2>Your data</h2>
-      <p class="small">${Store.mode === 'cloud' ? 'Saved privately to this page in your Claude account.' : Store.st.gh ? 'Saved in this browser and synced to your private GitHub repository.' : 'Saved in this browser only. Download a backup regularly, or turn on GitHub sync above.'}</p>
+      <p class="small">${Store.mode === 'cloud' ? 'Saved privately to this page in your Claude account.' : Store.st.gh ? 'Saved in this browser and synced to your private GitHub repository.' : 'Saved in this browser only. Download a backup regularly, or turn on GitHub sync above.'}${Store.mode === 'local' ? (S.ui.persisted ? ' This browser has agreed not to clear it automatically.' : ' This browser may clear it if storage runs low or the site goes unused; on iPhone, add it to your Home Screen.') : ''}${lsGet('v25k.lastBackup') ? ` Last backup: ${esc(fmtDur(Date.now() - Date.parse(lsGet('v25k.lastBackup'))))} ago.` : ''}</p>
       <div class="row">
         <button class="btn" data-action="export-json">Download backup (JSON)</button>
         <button class="btn" data-action="export-csv">Export trades (CSV)</button>
@@ -3042,7 +3271,7 @@ details > summary { cursor: pointer; font-weight: 600; }
         <label class="field"><span>Profit split</span><select id="o-split"><option value="100" selected>100%</option><option value="90">90%</option><option value="80">80%</option></select></label>
         <label class="field"><span>Your risk per trade ($)</span><input id="o-risk" inputmode="decimal" value="150"><span class="hint">Start well under the $375 max trade loss.</span></label>
       </div>
-      <div class="row"><button class="btn primary" data-action="onboard">Open my desk</button></div>
+      <div class="row"><button class="btn primary" data-action="onboard">Open my desk</button><label class="btn">Restore a backup instead<input type="file" id="restore-file" accept=".json,application/json" hidden></label></div>
     </section>`;
   }
 
@@ -3062,6 +3291,8 @@ details > summary { cursor: pointer; font-weight: 600; }
     form.shots = Array.isArray(form.shots) ? form.shots : [];
     form._openIn = toLocalInput(form.openTs ? Date.parse(form.openTs) : null);
     form._closeIn = toLocalInput(form.closeTs ? Date.parse(form.closeTs) : null);
+    form._openOrig = form.openTs || null;
+    form._closeOrig = form.closeTs || null;
     form._netSign = fin(form.netManual) && form.netManual < 0 ? 'loss' : 'win';
     const set = c.set;
     const dlg = $('#dlg');
@@ -3126,8 +3357,8 @@ details > summary { cursor: pointer; font-weight: 600; }
     form.target = priceOf(g('tf-target').value, form.sym);
     // keep full-precision stored times unless the field was actually edited
     const oi = g('tf-open').value, ci = g('tf-close').value;
-    if (oi !== form._openIn) form.openTs = fromLocalInput(oi);
-    if (ci !== form._closeIn) form.closeTs = fromLocalInput(ci);
+    form.openTs = oi === form._openIn ? form._openOrig : fromLocalInput(oi);
+    form.closeTs = ci === form._closeIn ? form._closeOrig : fromLocalInput(ci);
     const nv = numOrNull(g('tf-net').value);
     form.netManual = nv == null ? null : nv < 0 ? nv : (form._netSign === 'loss' ? -nv : nv);
     form.fees = numOrNull(g('tf-fees').value);
@@ -3345,8 +3576,9 @@ details > summary { cursor: pointer; font-weight: 600; }
     try { d = JSON.parse(await file.text()); } catch (e) { toast('That file is not a Vanguard Desk backup.', 4000); return; }
     if (!d || !d.app || !Array.isArray(d.trades)) { toast('That file is not a Vanguard Desk backup.', 4000); return; }
     const incoming = migrateApp(d.app);
-    if (!S.app) S.app = incoming;
-    else for (const a of incoming.accounts) if (!S.app.accounts.find((x) => x.id === a.id)) S.app.accounts.push(a);
+    let added = [];
+    if (!S.app) { S.app = incoming; S.ui.activeId = incoming.activeId; saveUi(); }
+    else { added = incoming.accounts.filter((a) => !S.app.accounts.find((x) => x.id === a.id)); S.app.accounts.push(...added); }
     await Store.saveApp(true);
     let ok = 0, failed = 0;
     for (const coll of ['trades', 'days', 'events']) {
@@ -3354,6 +3586,10 @@ details > summary { cursor: pointer; font-weight: 600; }
       const r = await Store.putMany(coll, list);
       ok += coll === 'trades' ? r.ok : 0; failed += r.failed;
     }
+    // if the account on screen is empty (e.g. a new phone), show the restored one
+    const cur = activeAccount();
+    if (added.length && cur && ![...S.trades.values()].some((t) => t.acc === cur.id)) selectAccount((added.find((a) => a.id === incoming.activeId) || added[0]).id);
+    render();
     toast(`Restored ${plural(ok, 'trade')} from the backup${failed ? ` · ${failed} waiting to save` : ''}`, 4500);
   }
 
@@ -3425,6 +3661,14 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
     render();
     window.scrollTo(0, 0);
   }
+  // ask the browser not to clear this site's storage on its own (Chrome, Firefox, Safari home-screen apps)
+  async function askPersist() {
+    try {
+      if (!navigator.storage || !navigator.storage.persist || IN_FRAME) return;
+      S.ui.persisted = (await navigator.storage.persisted()) || (await navigator.storage.persist());
+      saveUi();
+    } catch (e) { /* not supported */ }
+  }
   function resetFilters() { Object.assign(S.ui, { jRange: 'all', jSym: '', jSetup: '', jResult: '', jSearch: '', jLimit: 40 }); saveUi(); }
   function saveDay(patch) {
     const c = ctx();
@@ -3432,6 +3676,14 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
     const id = `${c.acc.id}_${c.L.today}`;
     const cur = S.days.get(id) || { id, acc: c.acc.id, day: c.L.today };
     const next = Object.assign({}, cur, patch);
+    // stamp each changed field so two devices editing the same day merge field by field
+    const fu = Object.assign({}, cur.fu || {});
+    const ts = Store.stamp();
+    for (const k of Object.keys(patch)) {
+      if (k === 'checks') { for (const ck of Object.keys(patch.checks || {})) if (!!(cur.checks || {})[ck] !== !!patch.checks[ck]) fu['checks.' + ck] = ts; }
+      else fu[k] = ts;
+    }
+    next.fu = fu;
     for (const k of Object.keys(next)) if (next[k] === null) delete next[k];
     Store.put('days', next);
   }
@@ -3440,7 +3692,13 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
     if (!inp) return;
     const v = numOrNull(inp.value);
     if (v == null) { saveDay({ openPnl: null, openPnlAt: null }); return; }
-    const signed = v < 0 ? v : (S.ui.openUp === false ? -v : v);
+    // the sign comes from the toggle as shown on screen (it mirrors the saved value)
+    const down = !!$('[data-open-sign="down"][aria-pressed="true"]');
+    const signed = v < 0 ? v : (down ? -v : v);
+    S.ui.openUp = signed >= 0; saveUi();
+    // show the saved sign right away, so a quick second edit can't flip it
+    $$('[data-open-sign]').forEach((b) => b.setAttribute('aria-pressed', String((b.dataset.openSign === 'up') === (signed >= 0))));
+    inp.value = String(Math.abs(signed));
     saveDay({ openPnl: signed, openPnlAt: nowIso() });
   }
   document.addEventListener('click', async (ev) => {
@@ -3512,10 +3770,13 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
         const cleared = clearOpenPnlAfterLog();
         $('#q-net').value = '';
         toast(`Added ${t.sym} ${smoney(net)}${cleared ? ' · open P&L cleared' : ''}`);
+        S.ui.qQty = qty; saveUi();
+        renderPending = false; render();
         setTimeout(() => { const n = $('#q-net'); if (n) n.focus(); }, 60);
         break;
       }
       case 'clear-open': saveDay({ openPnl: null, openPnlAt: null }); break;
+      case 'clear-carried': saveDay({ openPnl: 0, openPnlAt: nowIso() }); toast('Marked as closed'); break;
       case 'calc-clear': Object.assign(S.ui.calc, { entry: '', stop: '', target: '', stopTicks: '', targetTicks: '' }); saveUi(); render(); break;
       case 'calc-log': {
         const c = ctx(); const k = S.ui.calc; const s = E.sizeTrade(calcInputs(c));
@@ -3562,11 +3823,20 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
         break;
       }
       case 'dismiss-local': S.flags.pendingLocal = null; render(); break;
-      case 'hide-local-tip': S.ui.hideLocalTip = true; saveUi(); render(); break;
+      case 'hide-local-tip': S.ui.hideLocalTipAt = nowIso(); saveUi(); render(); break;
       case 'reload': location.reload(); break;
       case 'retry-save': Store.flushOutbox(); toast('Retrying…'); break;
       case 'gh-sync': Store.ghSync().then((ok) => toast(ok ? 'Synced with GitHub' : 'GitHub sync failed: ' + (Store.st.ghError || ''), 4000)); break;
       case 'gh-disconnect': Store.ghDisconnect(); toast('GitHub sync turned off on this device'); render(); break;
+      case 'gh-replace': {
+        const msg = $('#gh-msg');
+        if (msg) { msg.textContent = 'Checking…'; msg.className = ''; }
+        el.disabled = true;
+        const r = await Store.ghConnect(Store.st.gh.repo, $('#gh-token').value);
+        el.disabled = false;
+        if (r.ok) { toast('New token saved. Sync is working again.', 4000); render(); } else if (msg) { msg.textContent = r.msg; msg.className = 'bad'; }
+        break;
+      }
       case 'gh-connect': {
         const msg = $('#gh-msg');
         if (msg) msg.textContent = 'Connecting…';
@@ -3585,14 +3855,16 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
         if (risk != null && risk > 0) app.settings.risk.perTrade = risk;
         app.settings.risk.dailyStop = Math.round((acc.rules.dailyPct / 100) * size * 0.6);
         S.app = app;
+        S.ui.activeId = acc.id;
         await Store.saveApp(true);
         setTab('today');
         toast('Your desk is ready');
+        askPersist();
         break;
       }
       case 'add-account': {
         const acc = newAccount({ name: 'Vanguard 25K #' + (S.app.accounts.length + 1) });
-        S.app.accounts.push(acc); S.app.activeId = acc.id; resetFilters(); Store.saveApp(); toast('Account added. Rename it below.'); break;
+        S.app.accounts.push(acc); selectAccount(acc.id); Store.saveApp(); toast('Account added. Rename it below.'); break;
       }
       case 'reset-rules': { const acc = activeAccount(); const split = acc.rules.splitPct; acc.rules = Object.assign(E.rulesFor(acc.program, +acc.size), { splitPct: split }); Store.saveApp(); toast('Rules reset to the ' + E.PROGRAMS[acc.program].label + ' defaults'); break; }
       case 'wipe': {
@@ -3639,7 +3911,7 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
   document.addEventListener('change', async (ev) => {
     const t = ev.target;
     const acc = activeAccount();
-    if (t.id === 'acct-switch') { S.app.activeId = t.value; resetFilters(); Store.saveApp(); return; }
+    if (t.id === 'acct-switch') { selectAccount(t.value); render(); return; }
     if (t.id === 'c-sym') { if (t.value !== S.ui.calc.sym) S.ui.calc.fee = ''; S.ui.calc.sym = t.value; saveUi(); render(); return; }
     if (t.id === 'q-sym') { S.ui.qSym = t.value; saveUi(); return; }
     if (t.dataset.check != null && t.type === 'checkbox') { const c = ctx(); const checks = Object.assign({}, c.todayDoc.checks || {}); checks[t.dataset.check] = t.checked; saveDay({ checks }); return; }
@@ -3713,7 +3985,7 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
     if (VIEWS[h] && h !== S.ui.tab) setTab(h);
   });
   render();
-  Store.init();
+  Store.init().then(() => { if (Store.mode === 'local' && S.app) askPersist(); });
 })();
 
 </script>
