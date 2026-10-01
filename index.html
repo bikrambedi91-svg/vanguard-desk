@@ -130,6 +130,8 @@ input[type="number"] { font-family: var(--f-data); }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; padding: 2px; background: var(--sunk); gap: 2px; flex-wrap: wrap; }
 .seg button { border: 0; background: transparent; padding: 6px 12px; border-radius: 7px; font-weight: 600; cursor: pointer; color: var(--muted); font-size: .88rem; }
 .seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.field .row > .seg { flex-wrap: nowrap; flex: none; }
+.field .row > .seg button { padding: 6px 10px; }
 .seg.long-short button[data-v="long"][aria-pressed="true"] { color: var(--good); }
 .seg.long-short button[data-v="short"][aria-pressed="true"] { color: var(--bad); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -275,6 +277,25 @@ dialog::backdrop { background: rgba(8,12,18,.55); }
 .lightbox img { width: 100%; height: auto; display: block; }
 details > summary { cursor: pointer; font-weight: 600; }
 .kbd { font-family: var(--f-data); font-size: .76rem; border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; }
+/* ---------- iPhone app: native tab bar, lock screen ---------- */
+.native body { -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none; }
+/* a backdrop-filter on the header would trap the fixed tab bar inside it */
+.native .top { backdrop-filter: none; -webkit-backdrop-filter: none; background: var(--bg); }
+.native input, .native textarea, .native .num, .native .coach, .native td { -webkit-user-select: text; user-select: text; }
+.native .tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 25; margin: 0; gap: 0; justify-content: space-around; overflow: hidden; mask-image: none; -webkit-mask-image: none;
+  background: color-mix(in srgb, var(--surface) 90%, transparent); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  border-top: 1px solid var(--line); padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px)); }
+.native .tabs button { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 2px; border-bottom: 0; font-size: .66rem; font-weight: 600; }
+.native .tabs button svg { width: 22px; height: 22px; }
+.native .tabs button[aria-selected="true"] { color: var(--accent); }
+.native .top-in { padding-bottom: 8px; }
+.native main { padding-bottom: calc(150px + env(safe-area-inset-bottom, 0px)); }
+.native .fab { bottom: calc(76px + env(safe-area-inset-bottom, 0px)); }
+.native .toast[popover], .native .toast { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
+#face-lock { position: fixed; inset: 0; z-index: 100; background: var(--bg); display: grid; place-items: center; padding: 24px; }
+#face-lock .fl-in { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+#face-lock b { font: 800 1.6rem/1.1 var(--f-display); text-transform: uppercase; }
+#face-lock span { color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -2191,6 +2212,9 @@ details > summary { cursor: pointer; font-weight: 600; }
   const ID_RE = /^[A-Za-z0-9_.~:@+-]{1,180}$/;
   const SIZES = [25000, 50000, 100000, 150000, 200000, 250000, 300000];
   const IN_FRAME = !!(window.claude && typeof window.claude.use === 'function');
+  // the iPhone app (Capacitor) sets window.DeskNative before this script runs
+  const NATIVE = window.DeskNative && window.DeskNative.isNative ? window.DeskNative : null;
+  const WHERE = NATIVE ? 'on this iPhone' : 'in this browser';
   const pxFmt = (v, sym) => {
     if (!fin(v)) return '—';
     const i = E.inst(sym);
@@ -2262,6 +2286,9 @@ details > summary { cursor: pointer; font-weight: 600; }
   const MARGINS = { ES: 25060, MES: 2506, NQ: 38887, RTY: 11035, YM: 14975, NG: 3049, GC: 20112, MGC: 2020, HG: 12000, CL: 7819, MCL: 784, '6E': 2400 };
   const PAIRS = { ES: 'MES', MES: 'ES', NQ: 'MNQ', MNQ: 'NQ', YM: 'MYM', MYM: 'YM', RTY: 'M2K', M2K: 'RTY', GC: 'MGC', MGC: 'GC', SI: 'SIL', SIL: 'SI', HG: 'MHG', MHG: 'HG', CL: 'MCL', MCL: 'CL', '6E': 'M6E', M6E: '6E', '6A': 'M6A', M6A: '6A', '6B': 'M6B', M6B: '6B', BTC: 'MBT', MBT: 'BTC', ETH: 'MET', MET: 'ETH' };
   const DEFAULT_REPO = 'bikrambedi91-svg/vanguard-desk-data';
+  // the iPhone build keeps third-party firm names out of its own labels
+  const NATIVE_LABELS = { vanguard: 'Instant funding · 3% trailing', thunderbolt: 'Evaluation (funded) · 4% trailing' };
+  const progLabel = (k) => (NATIVE && NATIVE_LABELS[k]) || (E.PROGRAMS[k] ? E.PROGRAMS[k].label : k);
 
   function newAccount(o = {}) {
     const size = SIZES.includes(+o.size) ? +o.size : 25000;
@@ -2362,6 +2389,16 @@ details > summary { cursor: pointer; font-weight: 600; }
   function saveUi() { clearTimeout(uiTimer); uiTimer = setTimeout(() => lsSet('v25k.ui.v1', S.ui), 300); }
 
   const Store = window.DeskStore.create(S, { notify: changed, toast, migrateApp, sanitize });
+  if (NATIVE) {
+    // iPhone tab bar: short labels with simple line icons
+    const ICONS = {
+      today: 'M4 12h4l3-8 4 16 3-8h2', size: 'M5 5h14v14H5zM9 9h6v6H9z', journal: 'M6 4h11a2 2 0 0 1 2 2v14H8a2 2 0 0 1-2-2zM6 18a2 2 0 0 1 2-2h11M9 8h6M9 11h6',
+      payout: 'M12 3v18M16 7.5c0-1.9-1.8-3-4-3s-4 1-4 3 2 2.6 4 3 4 1.2 4 3-1.8 3-4 3-4-1.1-4-3', stats: 'M5 20V10M12 20V4M19 20v-7',
+      rules: 'M12 3l7 3v6c0 4.4-3 7.7-7 9-4-1.3-7-4.6-7-9V6z', setup: 'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM4 12h2M18 12h2M12 4v2M12 18v2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4',
+    };
+    const LABEL = { today: 'Today', size: 'Size', journal: 'Journal', payout: 'Payout', stats: 'Stats', rules: 'Rules', setup: 'Setup' };
+    $$('.tabs button').forEach((b) => { const t = b.dataset.tab; b.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${ICONS[t]}"/></svg><span>${LABEL[t]}</span>`; });
+  }
   const ro = () => Store.st.readOnly;
 
   /* ================= derived ================= */
@@ -2441,6 +2478,24 @@ details > summary { cursor: pointer; font-weight: 600; }
     Store.cacheSoon();
     renderHeader();
     scheduleRender();
+    if (NATIVE) nativeSync();
+  }
+  // iPhone app: mirror the journal natively, keep reminders current, buzz when the status turns to Stop
+  let nativeTimer = null, lastLevel = null;
+  function nativeSync() {
+    NATIVE.persist();
+    clearTimeout(nativeTimer);
+    nativeTimer = setTimeout(() => {
+      const c = S.app && activeAccount() ? ctx() : null;
+      if (!c) return;
+      if (lastLevel && c.status.level === 'stop' && lastLevel !== 'stop') NATIVE.haptic('warning');
+      lastLevel = c.status.level;
+      const sr = S.ui.sessionRemind || {};
+      NATIVE.setReminders({
+        enabled: S.ui.reminders === true, inactivityDeadlineMs: c.I ? c.I.deadlineMs : null, accountName: c.acc.name,
+        session: { enabled: !!sr.enabled, hh: +sr.hh || 9, mm: +sr.mm || 0 }, etToUtc: E.etToUtc, etParts: E.etParts,
+      });
+    }, 800);
   }
   function typingInMain() {
     const a = document.activeElement;
@@ -2481,6 +2536,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     main.innerHTML = view(c);
     if (S.ui.tab === 'size') updateCalc();
     if (S.ui.tab === 'stats') wireChart();
+    if (NATIVE && S.ui.tab === 'setup') NATIVE.version().then((v) => { const el = $('#n-version'); if (el && v) el.textContent = 'Prop Desk ' + v; });
     hydrateShots(main);
     window.scrollTo(0, sx);
   }
@@ -2503,13 +2559,13 @@ details > summary { cursor: pointer; font-weight: 600; }
       if (st.ghLast) return ['cloud', 'Synced with GitHub ' + fmtTime(st.ghLast)];
       return ['cloud', 'GitHub sync on'];
     }
-    return ['local', 'Saved in this browser'];
+    return ['local', NATIVE ? 'Saved on this iPhone' : 'Saved in this browser'];
   }
   function renderHeader() {
     $$('.tabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === S.ui.tab)));
     const sw = $('#acct-switch');
     const acc = activeAccount();
-    $('#brand-name').textContent = acc ? `${acc.name} Desk` : 'Vanguard 25K Desk';
+    $('#brand-name').textContent = acc ? `${acc.name} Desk` : NATIVE ? 'Prop Desk' : 'Vanguard 25K Desk';
     if (S.app && S.app.accounts.length > 1) {
       sw.hidden = false;
       sw.innerHTML = S.app.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === acc.id ? 'selected' : ''}>${esc(a.name)}${a.platformId ? ' #' + esc(a.platformId) : ''}</option>`).join('');
@@ -2559,8 +2615,8 @@ details > summary { cursor: pointer; font-weight: 600; }
     }
     const lastBackup = lsGet('v25k.lastBackup');
     const backupAge = lastBackup ? Date.now() - Date.parse(lastBackup) : Infinity;
-    if (st.mode === 'local' && !st.gh && c && c.trades.length && backupAge > 7 * E.DAY) out.push(`<div class="banner warn"><span><b>${lastBackup ? 'Last backup ' + fmtDur(backupAge) + ' ago.' : 'No backup yet.'}</b> Your journal lives only in this browser, which can clear it. Download a backup, or turn on GitHub sync.</span><span class="row"><button class="btn sm primary" data-action="export-json">Download backup</button><button class="btn sm" data-tab-go="setup">Set up sync</button></span></div>`);
-    if (st.mode === 'local' && !st.gh && !(S.ui.hideLocalTipAt && Date.now() - Date.parse(S.ui.hideLocalTipAt) < 7 * E.DAY) && !(c && c.trades.length && backupAge > 7 * E.DAY)) out.push(`<div class="banner info"><span>Your journal saves in this browser. To use it on your phone and computer, turn on GitHub sync in Setup. Download a backup each week either way.</span><span class="row"><button class="btn sm" data-tab-go="setup">Set up sync</button><button class="btn sm ghost" data-action="hide-local-tip">Hide</button></span></div>`);
+    if (st.mode === 'local' && !NATIVE && !st.gh && c && c.trades.length && backupAge > 7 * E.DAY) out.push(`<div class="banner warn"><span><b>${lastBackup ? 'Last backup ' + fmtDur(backupAge) + ' ago.' : 'No backup yet.'}</b> Your journal lives only in this browser, which can clear it. Download a backup, or turn on GitHub sync.</span><span class="row"><button class="btn sm primary" data-action="export-json">Download backup</button><button class="btn sm" data-tab-go="setup">Set up sync</button></span></div>`);
+    if (st.mode === 'local' && !st.gh && !(S.ui.hideLocalTipAt && Date.now() - Date.parse(S.ui.hideLocalTipAt) < 7 * E.DAY) && !(c && c.trades.length && backupAge > 7 * E.DAY)) out.push(`<div class="banner info"><span>${NATIVE ? 'Your journal saves on this iPhone, with a daily backup in the Files app. To see it on your computer too, turn on GitHub sync in Setup.' : 'Your journal saves in this browser. To use it on your phone and computer, turn on GitHub sync in Setup. Download a backup each week either way.'}</span><span class="row"><button class="btn sm" data-tab-go="setup">Set up sync</button><button class="btn sm ghost" data-action="hide-local-tip">Hide</button></span></div>`);
     if (st.mode === 'local' && st.gh && st.ghState === 'error') out.push(`<div class="banner warn"><span><b>GitHub sync failed:</b> ${esc(st.ghError || '')}</span><span class="row"><button class="btn sm" data-action="gh-sync">Try again</button><button class="btn sm" data-tab-go="setup">Fix in Setup</button></span></div>`);
     if (st.readOnly && st.mode !== 'offline') out.push(`<div class="banner warn"><span>You can view this desk but not change it.</span></div>`);
     if (c) {
@@ -3060,7 +3116,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     const floorPath = pts.map((p, k) => (k ? `L${x(k).toFixed(1)},${y(pts[k - 1].floor).toFixed(1)} L${x(k).toFixed(1)},${y(p.floor).toFixed(1)}` : `M${x(0).toFixed(1)},${y(p.floor).toFixed(1)}`)).join(' ');
     const grid = Array.from({ length: 5 }, (_, k) => lo + ((hi - lo) * k) / 4).map((v) => `<g><line x1="${padL}" x2="${W - padR}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}" stroke="var(--line)" stroke-width="1"/><text x="${padL - 8}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--muted)" font-family="var(--f-data)">${money0(v)}</text></g>`).join('');
     const every = Math.max(1, Math.ceil(pts.length / 8));
-    const xl = pts.map((p, k) => (k % every === 0 || k === pts.length - 1 ? `<text x="${x(k).toFixed(1)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="var(--muted)">${esc(p.label)}</text>` : '')).join('');
+    const xl = pts.map((p, k) => ((k % every === 0 && pts.length - 1 - k >= every) || k === pts.length - 1 ? `<text x="${x(k).toFixed(1)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="var(--muted)">${esc(p.label)}</text>` : '')).join('');
     const area = `${line} L${x(pts.length - 1).toFixed(1)},${(H - padB).toFixed(1)} L${x(0).toFixed(1)},${(H - padB).toFixed(1)} Z`;
     const last = pts[pts.length - 1];
     S._chart = { pts, x, y, W, H };
@@ -3126,10 +3182,10 @@ details > summary { cursor: pointer; font-weight: 600; }
   function viewRules(c) {
     const R = c.acc.rules, size = c.acc.size;
     const v = (fn) => { try { return esc(fn(size, R)); } catch (e) { return ''; } };
-    const other = c.acc.program !== 'vanguard' ? `<div class="banner warn"><span>This page describes <b>Vanguard</b>. Your ${esc(c.acc.name)} account uses the ${esc(E.PROGRAMS[c.acc.program].label)} values in Setup; confirm them in the Upcomers help center.</span></div>` : '';
+    const other = c.acc.program !== 'vanguard' ? `<div class="banner warn"><span>This page describes <b>Vanguard</b>. Your ${esc(c.acc.name)} account uses the ${esc(progLabel(c.acc.program))} values in Setup; confirm them in the Upcomers help center.</span></div>` : '';
     return `${other}
     <section class="card">
-      <div class="card-h"><div><h2>Vanguard rules for your ${money0(size)} account</h2><p class="small muted">From the official Upcomers help center, checked ${esc(window.RULES_CHECKED || '')}. Upcomers can change them, so open the source when in doubt.</p></div><span class="badge plain">${esc(c.acc.platformId ? 'Account ' + c.acc.platformId : 'Vanguard · Instant')}</span></div>
+      <div class="card-h"><div><h2>${NATIVE ? 'Rules' : 'Vanguard rules'} for your ${money0(size)} account</h2><p class="small muted">From the official Upcomers help center, checked ${esc(window.RULES_CHECKED || '')}. Upcomers can change them, so open the source when in doubt.</p></div><span class="badge plain">${esc(c.acc.platformId ? 'Account ' + c.acc.platformId : 'Vanguard · Instant')}</span></div>
       ${(window.RULEBOOK || []).map((r) => `<div class="rule"><div><div class="k">${esc(r.label)}</div>${r.kind ? `<span class="badge ${r.kind === 'Hard breach' ? 'bad' : r.kind === 'Payout only' ? 'warn' : 'plain'}">${esc(r.kind)}</span>` : ''}</div><div class="stack" style="gap:4px"><div class="val">${v(r.value)}</div><div class="why">${esc(r.text)}</div>${r.src ? `<div class="src"><a href="${HC + esc(r.src)}" target="_blank" rel="noopener">Source</a></div>` : ''}</div></div>`).join('')}
     </section>
     <div class="grid g2">
@@ -3162,11 +3218,11 @@ details > summary { cursor: pointer; font-weight: 600; }
         <p class="tiny muted">Turning off keeps everything in this browser and in GitHub; it only stops syncing here.</p></section>`;
     }
     return `<section class="card stack" id="sync"><h2>Use it on your phone and computer</h2>
-      <p class="small">This site saves in each browser separately. To see the same journal everywhere, connect a <b>private</b> GitHub repository. Do this once on each device:</p>
+      <p class="small">${NATIVE ? 'The app saves on this iPhone.' : 'This site saves in each browser separately.'} To see the same journal everywhere (iPhone app, website on your computer), connect a <b>private</b> GitHub repository. Do this once on each device:</p>
       <ol class="small" style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px">
         <li>Your private repository is <b>${esc(DEFAULT_REPO)}</b>. Any private repo works.</li>
         <li>Create a token at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>. Under <i>Repository access</i> choose <b>Only select repositories</b> and pick that repo. Under <i>Repository permissions</i>, set <b>Contents</b> to <b>Read and write</b>. Pick an expiry you're happy with, then generate it.</li>
-        <li>Paste the token below and press Connect. It stays in this browser only.</li>
+        <li>Paste the token below and press Connect. It stays ${WHERE} only.</li>
       </ol>
       <div class="grid g2">
         <label class="field"><span>Repository (owner/name)</span><input id="gh-repo" value="${esc(DEFAULT_REPO)}" autocomplete="off" spellcheck="false"></label>
@@ -3174,6 +3230,18 @@ details > summary { cursor: pointer; font-weight: 600; }
       </div>
       <div class="row"><button class="btn primary sm" data-action="gh-connect">Connect</button><span class="small" id="gh-msg"></span></div>
       <p class="tiny muted">Only connect on your own devices. The token stays in this browser and can only reach the one repository you picked. Pages you publish yourself on the same github.io address can read this browser's storage for that address, so don't add pages you don't trust there.</p></section>`;
+  }
+  function nativeCardHTML() {
+    if (!NATIVE) return '';
+    const sr = S.ui.sessionRemind || {};
+    const hh = +sr.hh || 9, mm = +sr.mm || 0;
+    const autoB = lsGet('v25k.lastAutoBackup');
+    return `<section class="card stack"><h2>iPhone app</h2>
+      <label class="check"><input type="checkbox" id="n-lock" ${S.ui.faceLock ? 'checked' : ''}><span><b>Lock with Face ID.</b> Asks for Face ID (or your passcode) when the app opens, and after 30 seconds away.</span></label>
+      <label class="check"><input type="checkbox" id="n-remind" ${S.ui.reminders === true ? 'checked' : ''}><span><b>Inactivity reminders.</b> A notification 3 days and 1 day before the 14-day no-trade deadline.</span></label>
+      <label class="check"><input type="checkbox" id="n-session" ${sr.enabled ? 'checked' : ''}><span><b>Session plan reminder</b> on weekdays at <input type="time" id="n-session-time" value="${pad(hh)}:${pad(mm)}" class="inp" style="width:auto;display:inline-block;padding:2px 6px"> ET.</span></label>
+      <p class="small muted">Backups: one JSON file a day goes to Files › On My iPhone › Prop Desk › Backups (the last 30 are kept).${autoB ? ' Last one ' + esc(fmtDur(Date.now() - Date.parse(autoB))) + ' ago.' : ''}</p>
+      <p class="tiny muted" id="n-version"></p></section>`;
   }
   function viewSetup(c) {
     const a = c.acc, R = a.rules, set = c.set, r = set.risk;
@@ -3184,9 +3252,9 @@ details > summary { cursor: pointer; font-weight: 600; }
       <div class="card-h" style="margin:0"><h2>Account</h2>${ro() ? '' : '<button class="btn sm" data-action="add-account">+ Add another account</button>'}</div>
       <div class="grid g3">
         <label class="field"><span>Name</span><input id="a-name" value="${esc(a.name)}" maxlength="60"></label>
-        <label class="field"><span>Upcomers account #</span><input id="a-pid" value="${esc(a.platformId)}" placeholder="e.g. 123456" maxlength="30"></label>
+        <label class="field"><span>${NATIVE ? 'Prop firm account #' : 'Upcomers account #'}</span><input id="a-pid" value="${esc(a.platformId)}" placeholder="e.g. 123456" maxlength="30"></label>
         <label class="field"><span>Bought or funded on</span><input id="a-start" type="date" value="${esc(a.startDate)}"><span class="hint">Starts the 14-day inactivity clock.</span></label>
-        <label class="field"><span>Program</span><select id="a-program">${Object.entries(E.PROGRAMS).map(([k, p]) => `<option value="${k}" ${a.program === k ? 'selected' : ''}>${esc(p.label)}</option>`).join('')}</select><span class="hint">Switching resets the rule values.</span></label>
+        <label class="field"><span>Program</span><select id="a-program">${Object.keys(E.PROGRAMS).map((k) => `<option value="${k}" ${a.program === k ? 'selected' : ''}>${esc(progLabel(k))}</option>`).join('')}</select><span class="hint">Switching resets the rule values.</span></label>
         <label class="field"><span>Account size</span><select id="a-size">${SIZES.map((s) => `<option value="${s}" ${+a.size === s ? 'selected' : ''}>${money0(s)}</option>`).join('')}</select><span class="hint">Changing size resets the rule values to the defaults for that size.</span></label>
         <label class="field"><span>Profit split</span><select id="r-split">${[80, 90, 100].map((s) => `<option value="${s}" ${+R.splitPct === s ? 'selected' : ''}>${s}%</option>`).join('')}</select></label>
       </div>
@@ -3230,6 +3298,7 @@ details > summary { cursor: pointer; font-weight: 600; }
         <label class="field"><span>Favourite instruments</span><input id="s-favs" value="${esc(set.favorites.join(', '))}"><span class="hint">Shown first in the calculator. Comma separated.</span></label>
       </div>
     </section>
+    ${nativeCardHTML()}
     ${syncCardHTML()}
     <div class="grid g2">
       ${listEditor('setups', 'Setups', 'Tag each trade with the setup you took. Stats show which ones pay.')}
@@ -3239,13 +3308,14 @@ details > summary { cursor: pointer; font-weight: 600; }
     </div>
     <section class="card stack">
       <h2>Your data</h2>
-      <p class="small">${Store.mode === 'cloud' ? 'Saved privately to this page in your Claude account.' : Store.st.gh ? 'Saved in this browser and synced to your private GitHub repository.' : 'Saved in this browser only. Download a backup regularly, or turn on GitHub sync above.'}${Store.mode === 'local' ? (S.ui.persisted ? ' This browser has agreed not to clear it automatically.' : ' This browser may clear it if storage runs low or the site goes unused; on iPhone, add it to your Home Screen.') : ''}${lsGet('v25k.lastBackup') ? ` Last backup: ${esc(fmtDur(Date.now() - Date.parse(lsGet('v25k.lastBackup'))))} ago.` : ''}</p>
+      <p class="small">${Store.mode === 'cloud' ? 'Saved privately to this page in your Claude account.' : Store.st.gh ? 'Saved in this browser and synced to your private GitHub repository.' : (NATIVE ? 'Saved on this iPhone, with a daily backup in the Files app. Turn on GitHub sync above to use it on other devices too.' : 'Saved in this browser only. Download a backup regularly, or turn on GitHub sync above.')}${Store.mode === 'local' && !NATIVE ? (S.ui.persisted ? ' This browser has agreed not to clear it automatically.' : ' This browser may clear it if storage runs low or the site goes unused; on iPhone, add it to your Home Screen.') : ''}${lsGet('v25k.lastBackup') ? ` Last backup: ${esc(fmtDur(Date.now() - Date.parse(lsGet('v25k.lastBackup'))))} ago.` : ''}</p>
       <div class="row">
-        <button class="btn" data-action="export-json">Download backup (JSON)</button>
+        <button class="btn" data-action="export-json">${NATIVE ? 'Share a backup (JSON)' : 'Download backup (JSON)'}</button>
         <button class="btn" data-action="export-csv">Export trades (CSV)</button>
         ${ro() ? '' : `<button class="btn" data-action="import">Import trades (CSV)</button>
         <label class="btn">Restore a backup<input type="file" id="restore-file" accept=".json,application/json" hidden></label>`}
       </div>
+      <p class="tiny muted">Prop Desk is a journal and calculator. It has no brokerage connection, never places trades or handles money, and is not financial advice. <a href="https://bikrambedi91-svg.github.io/vanguard-desk/privacy.html" target="_blank" rel="noopener">Privacy policy</a> · <a href="https://bikrambedi91-svg.github.io/vanguard-desk/support.html" target="_blank" rel="noopener">Support</a></p>
       ${ro() ? '' : `<details><summary class="bad">Danger zone</summary>
         <div class="stack" style="margin-top:10px">
           <p class="small">Delete every trade, day note and payout for <b>${esc(a.name)}</b>. Download a backup first; this can't be undone here.</p>
@@ -3259,13 +3329,13 @@ details > summary { cursor: pointer; font-weight: 600; }
   function onboardingHTML() {
     const local = Store.mode === 'local';
     return `<section class="card stack" style="max-width:720px;margin:0 auto;width:100%">
-      <div><span class="eyebrow">Set up once</span><h2 style="font:800 2rem/1.05 var(--f-display);text-transform:uppercase;margin-top:4px">Your Vanguard desk</h2>
-      <p class="small muted" style="margin-top:6px">A journal and position-size calculator that track the Vanguard rules for you: the trailing floor, the 2% daily drawdown, the $375 max trade loss on 25K, and payout readiness.</p></div>
+      <div><span class="eyebrow">Set up once</span><h2 style="font:800 2rem/1.05 var(--f-display);text-transform:uppercase;margin-top:4px">${NATIVE ? 'Your trading desk' : 'Your Vanguard desk'}</h2>
+      <p class="small muted" style="margin-top:6px">A journal and position-size calculator that track your prop account's rules for you: the trailing floor, the daily drawdown, the max trade loss, and payout readiness. ${NATIVE ? 'Rule presets are included for common instant-funding and evaluation programs; edit them any time.' : 'Rule presets are included for Upcomers’ Vanguard and Thunderbolt programs; edit them any time.'}</p><p class="tiny muted" style="margin-top:6px">No brokerage connection. It never places trades or handles money, and it isn't financial advice. Your journal stays on your device. <a href="https://bikrambedi91-svg.github.io/vanguard-desk/privacy.html" target="_blank" rel="noopener">Privacy policy</a></p></div>
       ${local ? `<details class="banner info" style="display:block"><summary>Already using the desk on another device? Connect GitHub sync first</summary><div style="margin-top:10px">${syncCardHTML().replace('<section class="card stack" id="sync">', '<div class="stack">').replace(/<\/section>$/, '</div>')}</div></details>` : ''}
       <div class="grid g2">
-        <label class="field"><span>Account name</span><input id="o-name" value="Vanguard 25K" maxlength="60"></label>
-        <label class="field"><span>Upcomers account # (optional)</span><input id="o-pid" placeholder="e.g. 123456" maxlength="30"></label>
-        <label class="field"><span>Program</span><select id="o-program">${Object.entries(E.PROGRAMS).map(([k, p]) => `<option value="${k}" ${k === 'vanguard' ? 'selected' : ''}>${esc(p.label)}</option>`).join('')}</select></label>
+        <label class="field"><span>Account name</span><input id="o-name" value="${NATIVE ? 'Funded 25K' : 'Vanguard 25K'}" maxlength="60"></label>
+        <label class="field"><span>${NATIVE ? 'Prop firm account # (optional)' : 'Upcomers account # (optional)'}</span><input id="o-pid" placeholder="e.g. 123456" maxlength="30"></label>
+        <label class="field"><span>Program</span><select id="o-program">${Object.keys(E.PROGRAMS).map((k) => `<option value="${k}" ${k === 'vanguard' ? 'selected' : ''}>${esc(progLabel(k))}</option>`).join('')}</select></label>
         <label class="field"><span>Account size</span><select id="o-size">${SIZES.map((s) => `<option value="${s}" ${s === 25000 ? 'selected' : ''}>${money0(s)}</option>`).join('')}</select></label>
         <label class="field"><span>Bought or funded on</span><input id="o-start" type="date" value="${localTodayIso()}"></label>
         <label class="field"><span>Profit split</span><select id="o-split"><option value="100" selected>100%</option><option value="90">90%</option><option value="80">80%</option></select></label>
@@ -3470,6 +3540,7 @@ details > summary { cursor: pointer; font-weight: 600; }
     saveUi();
     const cleared = isNew && clearOpenPnlAfterLog();
     toast(`${isNew ? 'Logged' : 'Updated'} ${clean.sym} ${smoney(k.net)}${cleared ? ' · open P&L cleared' : ''}`);
+    if (NATIVE) NATIVE.haptic('success');
     if (again) openTradeForm(null, { sym: clean.sym, side: clean.side, qty: clean.qty, setup: clean.setup });
     else { $('#dlg').close(); form = null; }
   }
@@ -3536,11 +3607,15 @@ details > summary { cursor: pointer; font-weight: 600; }
 
   /* ================= exports and backups ================= */
   async function offerFile(filename, data) {
-    if (S.flags.downloads) {
-      try { await S.flags.downloads.save({ filename, data }); toast('Saved ' + filename); return; }
-      catch (e) { if (e && e.code === 'declined') return; }
+    if (NATIVE) {
+      try { const r = await NATIVE.shareFile(filename, data); if (r === 'shared') { toast('Shared ' + filename); return true; } return false; }
+      catch (e) { showCopyDialog(filename, data); return false; }
     }
-    if (IN_FRAME) { showCopyDialog(filename, data); return; }
+    if (S.flags.downloads) {
+      try { await S.flags.downloads.save({ filename, data }); toast('Saved ' + filename); return true; }
+      catch (e) { if (e && e.code === 'declined') return false; }
+    }
+    if (IN_FRAME) { showCopyDialog(filename, data); return false; }
     try {
       const blob = new Blob([data], { type: filename.endsWith('.json') ? 'application/json' : 'text/csv' });
       const a = document.createElement('a');
@@ -3548,7 +3623,8 @@ details > summary { cursor: pointer; font-weight: 600; }
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
       toast('Downloaded ' + filename);
-    } catch (e) { showCopyDialog(filename, data); }
+      return true;
+    } catch (e) { showCopyDialog(filename, data); return false; }
   }
   function showCopyDialog(filename, data) {
     const dlg = $('#dlg');
@@ -3568,8 +3644,7 @@ details > summary { cursor: pointer; font-weight: 600; }
   }
   function exportJSON() {
     const data = JSON.stringify(Object.assign({ format: 'vanguard-desk', version: 1, exported: nowIso() }, Store.snapshotAll()), null, 1);
-    offerFile(`vanguard-desk-backup-${localTodayIso()}.json`, data);
-    lsSet('v25k.lastBackup', nowIso());
+    Promise.resolve(offerFile(`vanguard-desk-backup-${localTodayIso()}.json`, data)).then((ok) => { if (ok !== false) lsSet('v25k.lastBackup', nowIso()); });
   }
   async function restoreJSON(file) {
     let d;
@@ -3664,7 +3739,7 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
   // ask the browser not to clear this site's storage on its own (Chrome, Firefox, Safari home-screen apps)
   async function askPersist() {
     try {
-      if (!navigator.storage || !navigator.storage.persist || IN_FRAME) return;
+      if (!navigator.storage || !navigator.storage.persist || IN_FRAME || NATIVE) return;
       S.ui.persisted = (await navigator.storage.persisted()) || (await navigator.storage.persist());
       saveUi();
     } catch (e) { /* not supported */ }
@@ -3866,7 +3941,7 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
         const acc = newAccount({ name: 'Vanguard 25K #' + (S.app.accounts.length + 1) });
         S.app.accounts.push(acc); selectAccount(acc.id); Store.saveApp(); toast('Account added. Rename it below.'); break;
       }
-      case 'reset-rules': { const acc = activeAccount(); const split = acc.rules.splitPct; acc.rules = Object.assign(E.rulesFor(acc.program, +acc.size), { splitPct: split }); Store.saveApp(); toast('Rules reset to the ' + E.PROGRAMS[acc.program].label + ' defaults'); break; }
+      case 'reset-rules': { const acc = activeAccount(); const split = acc.rules.splitPct; acc.rules = Object.assign(E.rulesFor(acc.program, +acc.size), { splitPct: split }); Store.saveApp(); toast('Rules reset to the ' + progLabel(acc.program) + ' defaults'); break; }
       case 'wipe': {
         if (($('#wipe-confirm').value || '').trim() !== 'DELETE') { toast('Type DELETE to confirm.'); break; }
         const acc = activeAccount();
@@ -3914,6 +3989,24 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
     if (t.id === 'acct-switch') { selectAccount(t.value); render(); return; }
     if (t.id === 'c-sym') { if (t.value !== S.ui.calc.sym) S.ui.calc.fee = ''; S.ui.calc.sym = t.value; saveUi(); render(); return; }
     if (t.id === 'q-sym') { S.ui.qSym = t.value; saveUi(); return; }
+    if (t.id === 'n-lock' && NATIVE) {
+      if (t.checked) {
+        const b = await NATIVE.biometry();
+        if (!b.available) { t.checked = false; toast('Face ID or a passcode is not set up on this iPhone.', 4500); return; }
+        if (!(await NATIVE.verify('Turn on Face ID lock'))) { t.checked = false; return; }
+      }
+      S.ui.faceLock = t.checked; saveUi(); lsSet('v25k.ui.v1', S.ui); toast(t.checked ? 'Face ID lock is on' : 'Face ID lock is off'); return;
+    }
+    if (t.id === 'n-remind' || t.id === 'n-session' || t.id === 'n-session-time') {
+      if ((t.id === 'n-remind' || t.id === 'n-session') && t.checked && NATIVE) {
+        const p = await NATIVE.permission(true);
+        if (p !== 'granted') { t.checked = false; toast('Notifications are off for Prop Desk. Turn them on in iPhone Settings › Prop Desk › Notifications.', 5000); }
+      }
+      if (t.id === 'n-remind') S.ui.reminders = t.checked;
+      if (t.id === 'n-session') S.ui.sessionRemind = Object.assign({}, S.ui.sessionRemind, { enabled: t.checked });
+      if (t.id === 'n-session-time') { const [hh, mm] = String(t.value || '09:00').split(':').map(Number); S.ui.sessionRemind = Object.assign({}, S.ui.sessionRemind, { hh, mm }); }
+      saveUi(); if (NATIVE) nativeSync(); return;
+    }
     if (t.dataset.check != null && t.type === 'checkbox') { const c = ctx(); const checks = Object.assign({}, c.todayDoc.checks || {}); checks[t.dataset.check] = t.checked; saveDay({ checks }); return; }
     if (t.id === 'd-open') { saveOpenPnl(); return; }
     if (t.dataset.dayField) {
@@ -3956,7 +4049,7 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
     if (t.id === 'a-pid') { acc.platformId = t.value.trim().slice(0, 30); Store.saveApp(); return; }
     if (t.id === 'a-start') { if (/^\d{4}-\d{2}-\d{2}$/.test(t.value)) { acc.startDate = t.value; Store.saveApp(); } return; }
     if (t.id === 'a-size') { const split = R.splitPct; acc.size = +t.value; acc.rules = Object.assign(E.rulesFor(acc.program, acc.size), { splitPct: split }); Store.saveApp(); toast('Size changed; rules reset for ' + money0(acc.size)); return; }
-    if (t.id === 'a-program') { acc.program = E.PROGRAMS[t.value] ? t.value : 'vanguard'; acc.rules = E.rulesFor(acc.program, +acc.size); Store.saveApp(); toast('Rules set to ' + E.PROGRAMS[acc.program].label); return; }
+    if (t.id === 'a-program') { acc.program = E.PROGRAMS[t.value] ? t.value : 'vanguard'; acc.rules = E.rulesFor(acc.program, +acc.size); Store.saveApp(); toast('Rules set to ' + progLabel(acc.program)); return; }
     if (t.id === 's-favs') {
       const list = t.value.split(/[,\s]+/).map((x) => x.trim().toUpperCase()).filter((x) => E.inst(x));
       if (list.length) { set.favorites = [...new Set(list)].slice(0, 10); Store.saveApp(); } else toast('Use symbols like MES, MNQ, MGC.');
@@ -3985,7 +4078,18 @@ Write: 1) What's working (2-3 bullets with numbers). 2) Where money leaks (2-3 b
     if (VIEWS[h] && h !== S.ui.tab) setTab(h);
   });
   render();
-  Store.init().then(() => { if (Store.mode === 'local' && S.app) askPersist(); });
+  // the iPhone app first restores its native copy of the journal if iOS ever cleared web storage
+  Promise.resolve(NATIVE ? NATIVE.ready : null).then((restored) => {
+    Store.init().then(() => {
+      if (Store.mode === 'local' && S.app) askPersist();
+      if (NATIVE) {
+        NATIVE.hideSplash();
+        if (restored) toast('Your journal was restored from the copy saved on this iPhone.', 5000);
+        NATIVE.onResume(() => { memo = null; tickClock(); scheduleRender(); if (Store.st.gh) Store.ghSync(); nativeSync(); });
+        nativeSync();
+      }
+    });
+  });
 })();
 
 </script>
